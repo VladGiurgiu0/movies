@@ -3,7 +3,7 @@
 > **your movie taste — and your buddies'.** Private, on your machine, made with love.
 
 **Tastebuds** is a tiny, local movie companion. You rate the films you've seen,
-one at a time, and it quietly learns *your* taste and starts recommending films
+one at a time, and it learns *your* taste and starts recommending films
 you'll actually love. The name is a little pun: **taste** — the palate it learns
 from your ratings — and **buds** — your buddies, since you can swap libraries with
 friends and get recommendations from theirs.
