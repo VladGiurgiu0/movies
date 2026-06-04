@@ -1,4 +1,4 @@
-# Tastebuds 🍿
+# Tastebuds
 
 > **your movie taste — and your buddies'.** Private, on your machine, made with love.
 
@@ -13,14 +13,14 @@ are plain Markdown files you can open and read; the recommender is a small,
 transparent model trained right on your laptop — not a black box in someone
 else's cloud. No accounts, no tracking, no algorithm deciding for you in the dark.
 Think of it as a cozy, own-your-data home for your film life — open source, and
-made with love. 💛
+made with love.
 
 It runs in your browser but stays entirely local: a small Python web server, fed
 by [The Movie Database (TMDb)](https://www.themoviedb.org). The rater itself uses
 only the Python standard library; the optional recommender adds a single
 dependency (NumPy).
 
-📸 Follow the build: [**@tastebuds.film**](https://instagram.com/tastebuds.film)
+Follow the build: [**@tastebuds.film**](https://instagram.com/tastebuds.film)
 
 ## Features
 
