@@ -30,9 +30,12 @@ dependency (NumPy).
 - **Four verdicts** on an ordinal scale plus a separate watchlist:
   - `3` Liked · `2` Indifferent · `1` Disliked · `0` Not seen
   - **Add to Watchlist** for "want to watch later"
-- **Channels** — candidate pools defined by genres + keywords + a style
-  (Popular / Acclaimed / Hidden gems). Toggle them on/off or add your own from
-  the UI; they persist to `channels.json`.
+- **Channels** — the pools your movies come from, built four ways: by **genre**,
+  **"more like a movie"** you love (TMDb's neighbours of a seed film), **films by
+  a person** (a director or actor), or a **keyword** (a real TMDb tag, picked from
+  live results with film counts, with an *any / all* switch). Mix as many as you
+  like; your taste model ranks whatever they bring in. Toggle, edit, or remove any
+  of them; they persist to `channels.json`.
 - **Where you watch** — pick your **country and streaming services** (Netflix,
   MUBI, Disney+, …) and the films you discover, in *both* the rater and the
   recommender, are limited to titles you can actually stream. Leave it off to see
@@ -54,6 +57,9 @@ dependency (NumPy).
   **Share** button on the rater), and **import friends' libraries** (the
   **Friends** panel on the recommender) — one database per friend. A **"from"
   menu** switches whose taste you recommend from: *your* taste or any friend's.
+- **Guided first run** — on a fresh start, a short onboarding helps you paste your
+  TMDb key, make your first channel (just name a film you love), and learn how
+  rating works — so there's something to do from minute one.
 
 ## Requirements
 
@@ -88,9 +94,11 @@ and takes about two minutes.
 
 Then give the key to the app in **either** way:
 
-- **Option A (file):** create a file named `tmdb_key.txt` next to `tastebuds.py`
+- **Option A (in the app):** just run it — the **first-run onboarding** asks for
+  your key and saves it to `tmdb_key.txt` for you. No file editing needed.
+- **Option B (file):** create a file named `tmdb_key.txt` next to `tastebuds.py`
   and paste the key as its only contents.
-- **Option B (env var):** `export TMDB_API_KEY=your_key_here`
+- **Option C (env var):** `export TMDB_API_KEY=your_key_here`
 
 > Your key is personal — keep it private. `tmdb_key.txt` and `.env` are listed in
 > `.gitignore` so they are never committed.
@@ -101,30 +109,39 @@ Then give the key to the app in **either** way:
 python3 tastebuds.py
 ```
 
-A browser tab opens automatically. Rate away; press `Ctrl+C` in the terminal to
-stop. Your ratings are written to `movies.md` and saved titles to
-`watchlist.md` (both created automatically on first run).
+A browser tab opens automatically. **The first time**, a short setup walks you
+through your key and your first channel; after that you go straight to rating.
+Press `Ctrl+C` in the terminal to stop. Your ratings are written to `movies.md`
+and saved titles to `watchlist.md` (both created automatically).
 
 ## Channels
 
-Click **Channels** to manage the candidate pools:
+Channels are the pools your movies are drawn from. Open **Channels** to add as
+many as you like — and toggle, **edit**, or remove any. There are four kinds:
 
-- **Toggle** any channel on or off.
-- **Add a channel** with a name, comma-separated **keywords** (TMDb resolves
-  them, e.g. `coming-of-age, first love`), optional **genres**, and a **style**:
-  - *Popular* — sorted by popularity, modest quality floor
-  - *Acclaimed* — sorted by rating, higher vote threshold
-  - *Hidden gems* — high rating, lower popularity (surfaces obscure films)
-- A channel matches movies in **all** selected genres, narrowed by any keywords.
+- **Genre** — pick one or more genres and a style.
+- **More like a movie** — name a film you love; you get TMDb's neighbours of it.
+- **Films by a person** — a director or actor; you get films they were cast or
+  crew on.
+- **Keyword** — search TMDb's tags and pick a real one (shown with its film
+  count), with an **any / all** switch when you add several.
 
-Channels live in `channels.json`, so you can also edit them by hand.
+For the genre and keyword kinds, a **style** sets the sort and quality floor:
+
+- *Popular* — sorted by popularity, modest quality floor
+- *Acclaimed* — sorted by rating, higher vote threshold
+- *Hidden gems* — high rating, lower popularity (surfaces obscure films)
+
+Whatever your channels surface, the recommender ranks it by your taste — so the
+pools just need to point in roughly the right direction. Channels live in
+`channels.json`, so you can also edit them by hand.
 
 ## Files
 
 | File | Tracked by git? | What it is |
 |------|-----------------|------------|
 | `tastebuds.py` | yes | the whole app |
-| `channels.json` | **no** (git-ignored) | your candidate pools — auto-created from defaults on first run |
+| `channels.json` | **no** (git-ignored) | your channels — created when you add your first one (onboarding or the Channels panel) |
 | `movies.md` | **no** (git-ignored) | your personal ratings |
 | `watchlist.md` | **no** (git-ignored) | your personal watchlist |
 | `not-interested.md` | **no** (git-ignored) | films you marked *Not interested* |

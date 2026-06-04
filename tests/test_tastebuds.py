@@ -213,5 +213,130 @@ class TestRecommenderParsing(unittest.TestCase):
         self.assertEqual(by_id[111]["genres"], ["Drama"])
 
 
+class TestChannelKinds(unittest.TestCase):
+    """The redesigned channels: genre / movie / person / keyword, with
+    backward-compatible legacy channels and the keyword any/all (OR/AND) switch."""
+
+    def setUp(self):
+        self._calls = []
+        self._orig = (tb.tmdb_get, tb.resolve_keyword, tb.load_providers, tb._genre_map, tb.API_KEY)
+        tb.load_providers = lambda: {"region": "", "providers": []}   # no streaming filter
+        tb.resolve_keyword = lambda n: {"coming of age": 10683, "first love": 157303}.get(n.strip().lower())
+        tb._genre_map = {18: "Drama", 35: "Comedy"}
+        tb.API_KEY = "test"
+
+        def fake(path, params=None):
+            self._calls.append((path, dict(params or {})))
+            if path.endswith("/recommendations"):
+                return {"results": [{"id": 9, "title": "Rec", "poster_path": "/r.jpg", "genre_ids": [35],
+                                     "vote_average": 6.5, "release_date": "2019-01-01", "overview": "o"}]}
+            if path.endswith("/similar"):
+                return {"results": []}
+            return {"results": [{"id": 1, "title": "X", "poster_path": "/p.jpg", "genre_ids": [18],
+                                 "vote_average": 7.0, "release_date": "2020-01-01", "overview": "o"}],
+                    "total_results": 42}
+        tb.tmdb_get = fake
+
+    def tearDown(self):
+        (tb.tmdb_get, tb.resolve_keyword, tb.load_providers, tb._genre_map, tb.API_KEY) = self._orig
+
+    def _last_discover(self):
+        for p, pr in reversed(self._calls):
+            if p == "discover/movie":
+                return pr
+        return None
+
+    def test_legacy_channel_maps_to_discover(self):
+        c = tb.sanitize_channel({"name": "Indie", "genres": [18], "keywords": ["independent film"], "style": "acclaimed"})
+        self.assertEqual(c["kind"], "discover")
+        self.assertEqual(c["match"], "all")          # default preserves old AND behaviour
+        self.assertEqual(c["genres"], [18])
+
+    def test_keyword_any_is_or_joined(self):
+        c = tb.sanitize_channel({"kind": "discover", "keywords": ["coming of age", "first love"], "match": "any"})
+        tb.fetch_channel(c)
+        self.assertEqual(self._last_discover().get("with_keywords"), "10683|157303")
+
+    def test_keyword_all_is_and_joined(self):
+        c = tb.sanitize_channel({"kind": "discover", "keywords": ["coming of age", "first love"], "match": "all"})
+        tb.fetch_channel(c)
+        self.assertEqual(self._last_discover().get("with_keywords"), "10683,157303")
+
+    def test_person_channel_uses_with_people(self):
+        c = tb.sanitize_channel({"kind": "person", "person_id": 1243, "person_name": "Woody Allen"})
+        self.assertEqual(c["kind"], "person")
+        tb.fetch_channel(c)
+        d = self._last_discover()
+        self.assertEqual(d.get("with_people"), "1243")
+        self.assertNotIn("with_keywords", d)
+
+    def test_movie_seed_uses_recommendations_not_discover(self):
+        c = tb.sanitize_channel({"kind": "movie", "movie_id": 5, "movie_title": "Aftersun"})
+        out = tb.fetch_channel(c)
+        paths = [p for p, _ in self._calls]
+        self.assertTrue(any("movie/5/recommendations" in p for p in paths))
+        self.assertFalse(any(p == "discover/movie" for p in paths))
+        self.assertGreaterEqual(len(out), 1)
+
+    def test_search_helpers_shapes(self):
+        def fake2(path, params=None):
+            if path == "search/movie":
+                return {"results": [{"id": 5, "title": "Aftersun", "release_date": "2022-05-01", "vote_average": 7.7}]}
+            if path == "search/person":
+                return {"results": [{"id": 1243, "name": "Woody Allen", "known_for_department": "Directing"}]}
+            if path == "search/keyword":
+                return {"results": [{"id": 10683, "name": "coming of age"}]}
+            return {"results": [], "total_results": 7}
+        tb.tmdb_get = fake2
+        self.assertEqual(tb.search_movies("after")[0]["year"], "2022")
+        self.assertEqual(tb.search_people("woody")[0]["dept"], "Directing")
+        kw = tb.search_keywords("coming")[0]
+        self.assertEqual((kw["name"], kw["count"]), ("coming of age", 7))
+
+
+class TestOnboarding(unittest.TestCase):
+    """First-run state + in-app key save (no real key/network touched)."""
+
+    def test_save_api_key_validates_and_persists(self):
+        orig = (tb.KEY_PATH, tb._test_key, tb.API_KEY, tb._genre_map)
+        tmp = tempfile.mkdtemp()
+        tb.KEY_PATH = os.path.join(tmp, "tmdb_key.txt")
+        tb._test_key = lambda k: None                       # pretend TMDb accepted it
+        try:
+            ok, _ = tb.save_api_key("0123456789abcdef0123456789abcdef")
+            self.assertTrue(ok)
+            self.assertEqual(open(tb.KEY_PATH).read().strip(), "0123456789abcdef0123456789abcdef")
+            self.assertEqual(tb.API_KEY, "0123456789abcdef0123456789abcdef")
+
+            ok_short, _ = tb.save_api_key("abc")             # too short -> rejected, not persisted
+            self.assertFalse(ok_short)
+
+            import urllib.error
+            def reject(k):
+                raise urllib.error.HTTPError("u", 401, "no", {}, None)
+            tb._test_key = reject
+            ok_bad, _ = tb.save_api_key("z" * 32)            # TMDb says no -> rejected
+            self.assertFalse(ok_bad)
+            # the good key from earlier is still the one on disk
+            self.assertEqual(open(tb.KEY_PATH).read().strip(), "0123456789abcdef0123456789abcdef")
+        finally:
+            (tb.KEY_PATH, tb._test_key, tb.API_KEY, tb._genre_map) = orig
+
+    def test_needs_onboarding_logic(self):
+        orig = (tb.load_channels, tb.rated_ids, tb.watchlist_ids)
+        try:
+            tb.load_channels = lambda: []
+            tb.rated_ids = lambda: set()
+            tb.watchlist_ids = lambda: set()
+            self.assertTrue(tb.needs_onboarding())           # fresh: no channels, nothing rated
+            tb.load_channels = lambda: [{"kind": "movie"}]
+            self.assertFalse(tb.needs_onboarding())          # has a channel
+            tb.load_channels = lambda: []
+            tb.rated_ids = lambda: {1}
+            self.assertFalse(tb.needs_onboarding())          # has a rating
+        finally:
+            (tb.load_channels, tb.rated_ids, tb.watchlist_ids) = orig
+
+
 if __name__ == "__main__":
     unittest.main()

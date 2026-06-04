@@ -70,6 +70,7 @@ DIRECTOR_CACHE_PATH = os.path.join(SCRIPT_DIR, "director_cache.json")
 FRIENDS_PATH = os.path.join(SCRIPT_DIR, "friends.json")   # multi-friend list [{name, likes}]
 FRIEND_PATH = os.path.join(SCRIPT_DIR, "friend.json")     # legacy single-friend file (migrated on read)
 PROVIDERS_PATH = os.path.join(SCRIPT_DIR, "providers.json")  # {region, providers:[ids]} streaming filter
+KEY_PATH = os.path.join(SCRIPT_DIR, "tmdb_key.txt")          # where a pasted TMDb key is stored
 TABLE_END_MARKER = "<!-- TABLE-END -->"
 
 MD_ID_COL = 5          # TMDb ID column index in movies.md rows
@@ -141,19 +142,9 @@ STYLES = {
     "gems":      {"sort": "vote_average.desc",  "vote_count_gte": 30,  "vote_avg_gte": 6.5},
 }
 
-# Seed channels (written to channels.json on first run; editable afterwards).
-DEFAULT_CHANNELS = [
-    {"name": "Sundance-style romcom", "enabled": True, "genres": [10749, 35],
-     "keywords": [], "style": "popular", "vote_count_gte": 40, "vote_avg_gte": 6.0, "sort": "popularity.desc"},
-    {"name": "Coming-of-age", "enabled": True, "genres": [18],
-     "keywords": ["coming-of-age"], "style": "gems", "vote_count_gte": 30, "vote_avg_gte": 6.2, "sort": "vote_average.desc"},
-    {"name": "Indie / arthouse", "enabled": True, "genres": [18],
-     "keywords": ["independent film"], "style": "acclaimed", "vote_count_gte": 80, "vote_avg_gte": 6.8, "sort": "vote_average.desc"},
-    {"name": "Romantic drama", "enabled": True, "genres": [10749, 18],
-     "keywords": [], "style": "popular", "vote_count_gte": 60, "vote_avg_gte": 6.4, "sort": "popularity.desc"},
-    {"name": "Quirky comedy", "enabled": True, "genres": [35],
-     "keywords": [], "style": "gems", "vote_count_gte": 60, "vote_avg_gte": 6.5, "sort": "vote_average.desc"},
-]
+# A fresh install starts with NO channels — the first-run onboarding (or the
+# Channels panel) creates the user's own first channel, so nobody inherits a
+# stranger's taste.
 
 
 # --------------------------------------------------------------------------
@@ -163,15 +154,46 @@ def load_api_key():
     key = os.environ.get("TMDB_API_KEY", "").strip()
     if key:
         return key
-    keyfile = os.path.join(SCRIPT_DIR, "tmdb_key.txt")
-    if os.path.exists(keyfile):
-        with open(keyfile, "r", encoding="utf-8") as f:
+    if os.path.exists(KEY_PATH):
+        with open(KEY_PATH, "r", encoding="utf-8") as f:
             return f.read().strip()
     return ""
 
 
 API_KEY = load_api_key()
 TOKEN = secrets.token_hex(16)   # minted per run; the page embeds it and /api/* requires it
+
+
+def _test_key(key):
+    """Hit a cheap authenticated TMDb endpoint; raises on a bad key / no network."""
+    url = TMDB_API + "/configuration?" + urllib.parse.urlencode({"api_key": key})
+    req = urllib.request.Request(url, headers={"User-Agent": "tastebuds/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+
+def save_api_key(key):
+    """Validate a pasted TMDb key against the API, then persist it to tmdb_key.txt
+    and activate it for this running process. Returns (ok, message)."""
+    global API_KEY, _genre_map
+    key = (key or "").strip()
+    if not (10 <= len(key) <= 200):
+        return False, "That doesn't look like a TMDb key."
+    try:
+        _test_key(key)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, "TMDb didn't accept that key — double-check you copied the v3 key."
+        return False, "Couldn't reach TMDb just now. Check your connection and try again."
+    except Exception:
+        return False, "Couldn't reach TMDb just now. Check your connection and try again."
+    try:
+        _atomic_write(KEY_PATH, key + "\n")
+    except Exception:
+        return False, "Couldn't save the key file."
+    API_KEY = key
+    _genre_map = None   # re-fetch the genre list with the new key
+    return True, "ok"
 
 
 # --------------------------------------------------------------------------
@@ -195,20 +217,38 @@ def _numf(v, default):
 
 
 def sanitize_channel(c):
+    # A channel is one of three kinds:
+    #   "discover" - genres + keywords + style (the original; also covers Genre-only
+    #                and Keyword-only channels). Legacy channels (no "kind") map here.
+    #   "person"   - films a person was cast OR crew on (TMDb with_people).
+    #   "movie"    - TMDb "more like this" neighbours of a seed film.
+    kind = c.get("kind") if c.get("kind") in ("discover", "person", "movie") else "discover"
     style = c.get("style") if c.get("style") in STYLES else None
     preset = STYLES.get(style, {})
-    genres = c.get("genres", [])
-    keywords = c.get("keywords", [])
-    return {
-        "name": (str(c.get("name", "")).strip() or "Untitled")[:60],
+    out = {
+        "kind": kind,
+        "name": (str(c.get("name", "")).strip() or "Untitled")[:80],
         "enabled": bool(c.get("enabled", True)),
-        "genres": [int(g) for g in genres if str(g).strip().isdigit()][:5] if isinstance(genres, list) else [],
-        "keywords": [str(k).strip() for k in keywords if str(k).strip()][:6] if isinstance(keywords, list) else [],
         "style": style or "custom",
         "vote_count_gte": _num(c.get("vote_count_gte", preset.get("vote_count_gte")), 40),
         "vote_avg_gte": _numf(c.get("vote_avg_gte", preset.get("vote_avg_gte")), 6.0),
         "sort": str(c.get("sort", preset.get("sort", "popularity.desc"))),
     }
+    if kind == "person":
+        out["person_id"] = _num(c.get("person_id"), 0)
+        out["person_name"] = str(c.get("person_name", "")).strip()[:80]
+    elif kind == "movie":
+        out["movie_id"] = _num(c.get("movie_id"), 0)
+        out["movie_title"] = str(c.get("movie_title", "")).strip()[:120]
+    else:
+        genres = c.get("genres", [])
+        keywords = c.get("keywords", [])
+        out["genres"] = [int(g) for g in genres if str(g).strip().isdigit()][:5] if isinstance(genres, list) else []
+        out["keywords"] = [str(k).strip() for k in keywords if str(k).strip()][:6] if isinstance(keywords, list) else []
+        # how multiple keywords combine: "any" = OR (wider), "all" = AND (narrow).
+        # Default "all" preserves the behaviour of channels saved before this field existed.
+        out["match"] = "any" if c.get("match") == "any" else "all"
+    return out
 
 
 def save_channels(channels):
@@ -220,13 +260,11 @@ def load_channels():
         try:
             with open(CHANNELS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, list) and data:
+            if isinstance(data, list):
                 return [sanitize_channel(c) for c in data if isinstance(c, dict)]
         except Exception:
             pass
-    seed = [sanitize_channel(c) for c in DEFAULT_CHANNELS]
-    save_channels(seed)
-    return seed
+    return []   # fresh install: no channels until onboarding / the UI creates one
 
 
 # --------------------------------------------------------------------------
@@ -287,7 +325,12 @@ def _movie_from_tmdb(m):
 
 
 def fetch_channel(channel):
-    """Return a shuffled list of candidate movie dicts from one channel."""
+    """Return a shuffled list of candidate movie dicts from one channel.
+    Branches on channel kind: 'movie' uses TMDb's per-film recommendations;
+    'person' and 'discover' both use discover/movie with different filters."""
+    if channel.get("kind") == "movie":
+        return _fetch_movie_seed(channel)
+
     params = {
         "language": LANGUAGE,
         "include_adult": "false",
@@ -296,12 +339,18 @@ def fetch_channel(channel):
         "vote_average.gte": channel.get("vote_avg_gte", 6.0),
         "page": random.randint(1, MAX_PAGE),
     }
-    if channel.get("genres"):
-        params["with_genres"] = ",".join(str(g) for g in channel["genres"])
-    kw_ids = [resolve_keyword(n) for n in channel.get("keywords", [])]
-    kw_ids = [k for k in kw_ids if k]
-    if kw_ids:
-        params["with_keywords"] = ",".join(str(k) for k in kw_ids)
+    if channel.get("kind") == "person":
+        if not channel.get("person_id"):
+            return []
+        params["with_people"] = str(channel["person_id"])   # cast OR crew
+    else:
+        if channel.get("genres"):
+            params["with_genres"] = ",".join(str(g) for g in channel["genres"])
+        kw_ids = [resolve_keyword(n) for n in channel.get("keywords", [])]
+        kw_ids = [k for k in kw_ids if k]
+        if kw_ids:
+            joiner = "|" if channel.get("match") == "any" else ","   # any = OR, all = AND
+            params["with_keywords"] = joiner.join(str(k) for k in kw_ids)
 
     # Streaming filter: only films available on the user's selected platforms
     # (their subscriptions, in their country). Applies to every discover pull, so
@@ -325,6 +374,36 @@ def fetch_channel(channel):
         if mv:
             mv["channel"] = channel["name"]
             out.append(mv)
+    random.shuffle(out)
+    return out
+
+
+def _fetch_movie_seed(channel):
+    """Candidates = TMDb's neighbours of a seed film (its 'recommendations', then
+    'similar' as a fallback). That endpoint takes no discover filters, so the
+    streaming filter and quality floor don't apply here; the model ranks what
+    comes back."""
+    mid = channel.get("movie_id")
+    if not mid:
+        return []
+    out = []
+    for endpoint in ("recommendations", "similar"):
+        results = []
+        for page in (random.randint(1, 3), 1):
+            try:
+                data = tmdb_get(f"movie/{mid}/{endpoint}", {"language": LANGUAGE, "page": page})
+            except Exception:
+                continue
+            results = data.get("results", [])
+            if results:
+                break
+        for m in results:
+            mv = _movie_from_tmdb(m)
+            if mv:
+                mv["channel"] = channel["name"]
+                out.append(mv)
+        if out:
+            break
     random.shuffle(out)
     return out
 
@@ -536,6 +615,72 @@ def set_status(movie, status):
 
 
 # --------------------------------------------------------------------------
+# Seed search (for building movie / person / keyword channels)
+# --------------------------------------------------------------------------
+def search_movies(q):
+    """TMDb title search for a seed-film picker: [{id, title, year, rating}]."""
+    q = (q or "").strip()
+    if not q or not API_KEY:
+        return []
+    try:
+        data = tmdb_get("search/movie", {"query": q, "include_adult": "false", "language": LANGUAGE})
+    except Exception:
+        return []
+    out = []
+    for m in data.get("results", [])[:10]:
+        if m.get("id") is None:
+            continue
+        out.append({"id": m["id"],
+                    "title": m.get("title") or m.get("original_title") or "Untitled",
+                    "year": (m.get("release_date") or "")[:4],
+                    "rating": round(m.get("vote_average", 0), 1)})
+    return out
+
+
+def search_people(q):
+    """TMDb person search for a person-channel picker: [{id, name, dept}]."""
+    q = (q or "").strip()
+    if not q or not API_KEY:
+        return []
+    try:
+        data = tmdb_get("search/person", {"query": q, "include_adult": "false", "language": LANGUAGE})
+    except Exception:
+        return []
+    out = []
+    for p in data.get("results", [])[:10]:
+        if p.get("id") is None:
+            continue
+        out.append({"id": p["id"], "name": p.get("name", ""),
+                    "dept": p.get("known_for_department", "")})
+    return out
+
+
+def search_keywords(q):
+    """TMDb keyword search with each tag's film count, so the user can pick a real,
+    well-populated tag instead of a blind top hit: [{id, name, count}]."""
+    q = (q or "").strip()
+    if not q or not API_KEY:
+        return []
+    try:
+        data = tmdb_get("search/keyword", {"query": q})
+    except Exception:
+        return []
+    out = []
+    for k in data.get("results", [])[:6]:
+        kid = k.get("id")
+        if kid is None:
+            continue
+        count = None
+        try:
+            c = tmdb_get("discover/movie", {"with_keywords": str(kid), "vote_count.gte": 0})
+            count = c.get("total_results")
+        except Exception:
+            count = None
+        out.append({"id": kid, "name": k.get("name", ""), "count": count})
+    return out
+
+
+# --------------------------------------------------------------------------
 # Share / friends (export your likes, import friends' — one database per friend)
 # --------------------------------------------------------------------------
 def liked_export():
@@ -644,6 +789,19 @@ def list_providers(region):
         out.append({"id": p.get("provider_id"), "name": p.get("provider_name", ""),
                     "logo": (IMG_BASE_W92 + p["logo_path"]) if p.get("logo_path") else ""})
     return out
+
+
+# --------------------------------------------------------------------------
+# First-run onboarding
+# --------------------------------------------------------------------------
+def needs_onboarding():
+    """True only on a genuinely fresh start: no channels yet and nothing logged."""
+    try:
+        if load_channels():
+            return False
+        return len(rated_ids()) == 0 and len(watchlist_ids()) == 0
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -930,6 +1088,35 @@ PAGE = r"""<!DOCTYPE html>
   .er .er-link{font-size:12px;color:var(--blue);text-decoration:none;flex:0 0 auto;white-space:nowrap}
   .er .er-link:hover{text-decoration:underline}
 
+  /* Channels: kind-aware list + collapsible add cards */
+  .chlist-empty{font-size:12.5px;color:var(--muted);padding:6px 0;letter-spacing:-.01em}
+  .ch .ic{width:32px;height:32px;border-radius:9px;background:var(--gray-tint);display:flex;align-items:center;justify-content:center;color:var(--muted);flex:0 0 auto}
+  .ch .ic svg{width:17px;height:17px}
+  .ch .nm-in{font:inherit;font-size:14px;font-weight:600;border:1px solid var(--blue);border-radius:7px;padding:3px 7px;background:var(--card);color:var(--txt);width:100%}
+  .ch .sw{width:38px;height:22px;border-radius:999px;background:var(--gray-tint);position:relative;border:none;cursor:pointer;flex:0 0 auto;padding:0}
+  .ch .sw::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.18s}
+  .ch .sw.on{background:var(--teal)}
+  .ch .sw.on::after{left:18px}
+  .ch .iconbtn{background:none;border:none;color:var(--muted);cursor:pointer;padding:4px;border-radius:7px;display:inline-flex;align-items:center}
+  .ch .iconbtn:hover{color:var(--txt);background:var(--gray-tint)}
+  .ch .iconbtn svg{width:16px;height:16px}
+  .addlabel{font-size:12.5px;color:var(--muted);margin:16px 0 8px;letter-spacing:-.01em}
+  .acard{border:1px solid var(--line);border-radius:14px;margin-bottom:10px;overflow:hidden}
+  .acard .ahead{display:flex;align-items:center;gap:9px;padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600;letter-spacing:-.01em;user-select:none}
+  .acard .ahead svg.tic{width:18px;height:18px;color:var(--muted);flex:0 0 auto}
+  .acard .ahead .chev{margin-left:auto;color:var(--muted);transition:transform .2s}
+  .acard.open .ahead .chev{transform:rotate(180deg)}
+  .acard .abody{display:none;padding:2px 14px 14px}
+  .acard.open .abody{display:block}
+  .picker{margin-top:4px}
+  .pk{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;border-radius:9px;cursor:pointer;font-size:13.5px;letter-spacing:-.01em}
+  .pk:hover{background:var(--gray-tint)}
+  .pk .meta{color:var(--muted);font-size:12px;flex:0 0 auto;white-space:nowrap}
+  .chosen{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .ktag{display:inline-flex;align-items:center;gap:7px;background:rgba(18,143,134,.12);color:var(--teal);font-size:12.5px;padding:4px 10px;border-radius:980px;letter-spacing:-.01em}
+  .ktag .kx{cursor:pointer;font-weight:700;opacity:.8}
+  .ktag .kx:hover{opacity:1}
+
   /* ML panels (Train / Recommend) */
   .ml-msg{color:var(--muted);font-size:13px;letter-spacing:-.01em;padding:8px 0;line-height:1.5;white-space:pre-wrap}
   .stat{font-size:13.5px;color:var(--txt);margin:3px 0;letter-spacing:-.01em}
@@ -1009,6 +1196,31 @@ PAGE = r"""<!DOCTYPE html>
     .rate-row{grid-template-columns:1fr}
     .second-row{grid-template-columns:1fr}
   }
+
+  /* First-run onboarding */
+  #onb-overlay .panel{max-width:440px}
+  .onb-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+  .odots{display:flex;gap:6px}
+  .odot{width:7px;height:7px;border-radius:50%;background:var(--gray-tint)}
+  .odot.on{background:var(--teal)}
+  .onb-count{font-size:12px;color:var(--muted)}
+  .onb-step{display:none}
+  .onb-step.on{display:block}
+  .onb-ic{color:var(--teal);display:block;margin-bottom:4px}
+  .onb-ic svg{width:28px;height:28px}
+  .onb-h{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:6px 0 8px}
+  .onb-p{font-size:14px;color:var(--muted);line-height:1.6;margin:0 0 12px}
+  .onb-field{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--txt);font:inherit;font-size:14px}
+  .onb-row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:20px}
+  .onb-err{font-size:12px;color:var(--coral);margin-top:8px;min-height:15px;letter-spacing:-.01em}
+  .onb-note{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.5}
+  .onb-picked{font-size:12.5px;color:var(--teal);margin-top:8px;min-height:15px;letter-spacing:-.01em}
+  .onb-tip{font-size:13px;color:var(--txt);background:var(--gray-tint);padding:10px 12px;border-radius:10px;line-height:1.55;margin:4px 0 18px}
+  .onb-verd{display:flex;align-items:center;gap:9px;padding:6px 0;font-size:13.5px;letter-spacing:-.01em}
+  .onb-verd .vd{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .onb-verd b{font-weight:600}
+  .onb-skip{background:none;border:none;color:var(--muted);font:inherit;font-size:12.5px;cursor:pointer;text-decoration:underline;padding:0;letter-spacing:-.01em}
+  .pbtn:disabled{opacity:.45;cursor:default}
 </style></head>
 <body>
   <div class="page">
@@ -1069,22 +1281,52 @@ PAGE = r"""<!DOCTYPE html>
   <div class="overlay" id="overlay">
     <div class="panel" id="panel">
       <div class="phead"><h2>Channels</h2><button class="x" id="close-settings">&times;</button></div>
-      <p class="desc">Turn pools on or off, or add your own. A channel matches movies in <b>all</b> chosen genres, narrowed by any keywords.</p>
+      <p class="desc">The pools your movies are drawn from. Add as many as you like — your taste model ranks whatever they bring in.</p>
       <div id="ch-list"></div>
-      <div class="addbox">
-        <h3>Add a channel</h3>
-        <div class="fld"><label>Name (optional)</label><input id="ch-name" placeholder="e.g. First-love stories"></div>
-        <div class="fld"><label>Keywords (comma-separated, optional)</label><input id="ch-kw" placeholder="coming-of-age, first love"></div>
-        <div class="fld"><label>Genres (optional)</label><div class="gpick" id="ch-genres"></div></div>
-        <div class="fld"><label>Style</label>
-          <div class="seg" id="ch-style">
-            <button data-s="popular" class="on">Popular</button>
-            <button data-s="acclaimed">Acclaimed</button>
-            <button data-s="gems">Hidden gems</button>
+      <div class="addlabel">Add a channel</div>
+      <div id="add-cards">
+
+        <div class="acard" id="card-genre">
+          <div class="ahead"><svg class="tic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="14" width="7" height="7" rx="1.4"/><rect x="3" y="14" width="7" height="7" rx="1.4"/></svg>Genre<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg></div>
+          <div class="abody">
+            <div class="fld"><label>Name (optional)</label><input id="g-name" placeholder="e.g. Quirky comedies"></div>
+            <div class="fld"><label>Genres</label><div class="gpick" id="g-genres"></div></div>
+            <div class="fld"><label>Style</label><div class="seg" id="g-style"><button data-s="popular" class="on">Popular</button><button data-s="acclaimed">Acclaimed</button><button data-s="gems">Hidden gems</button></div></div>
+            <button class="pbtn primary" id="g-add" style="width:100%">Add channel</button>
+            <div class="note" id="g-note"></div>
           </div>
         </div>
-        <button class="pbtn primary" id="ch-add" style="width:100%">Add channel</button>
-        <div class="note" id="ch-note"></div>
+
+        <div class="acard" id="card-movie">
+          <div class="ahead"><svg class="tic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M8.5 4v16"/></svg>More like a movie<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg></div>
+          <div class="abody">
+            <div class="fld"><label>Search a film you love</label><input id="m-q" placeholder="e.g. Aftersun" autocomplete="off"></div>
+            <div class="picker" id="m-res"></div>
+          </div>
+        </div>
+
+        <div class="acard" id="card-person">
+          <div class="ahead"><svg class="tic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8.5" r="3.7"/><path d="M5 20c0-3.6 3.2-5.5 7-5.5s7 1.9 7 5.5"/></svg>Films by a person<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg></div>
+          <div class="abody">
+            <div class="fld"><label>Search a director or actor <span style="color:var(--muted)">— cast or crew</span></label><input id="p-q" placeholder="e.g. Greta Gerwig" autocomplete="off"></div>
+            <div class="picker" id="p-res"></div>
+          </div>
+        </div>
+
+        <div class="acard" id="card-keyword">
+          <div class="ahead"><svg class="tic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.6 13.4 12.8 21.2a1.8 1.8 0 0 1-2.6 0L3 14V4h10l7.6 7.4a1.8 1.8 0 0 1 0 2z"/><circle cx="7.5" cy="7.5" r="1.4"/></svg>Keyword<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg></div>
+          <div class="abody">
+            <div class="fld"><label>Name (optional)</label><input id="k-name" placeholder="e.g. Coming-of-age"></div>
+            <div class="fld"><label>Find a tag <span style="color:var(--muted)">— with its film count</span></label><input id="k-q" placeholder="e.g. coming of age" autocomplete="off"></div>
+            <div class="picker" id="k-res"></div>
+            <div class="chosen" id="k-chosen"></div>
+            <div class="fld" style="margin-top:10px"><label>Match</label><div class="seg" id="k-match"><button data-m="any" class="on">Any of these</button><button data-m="all">All of these</button></div></div>
+            <div class="fld"><label>Style</label><div class="seg" id="k-style"><button data-s="popular" class="on">Popular</button><button data-s="acclaimed">Acclaimed</button><button data-s="gems">Hidden gems</button></div></div>
+            <button class="pbtn primary" id="k-add" style="width:100%">Add channel</button>
+            <div class="note" id="k-note"></div>
+          </div>
+        </div>
+
       </div>
       <div class="prow">
         <button class="pbtn cancel" id="ch-cancel">Cancel</button>
@@ -1143,6 +1385,57 @@ PAGE = r"""<!DOCTYPE html>
         <button class="pbtn cancel" id="prov-clear">Turn off filter</button>
         <button class="pbtn primary" id="prov-save">Save &amp; close</button>
       </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="onb-overlay">
+    <div class="panel" id="onb-panel">
+      <div class="onb-top">
+        <div class="odots" id="onb-dots"></div>
+        <span class="onb-count" id="onb-count"></span>
+      </div>
+
+      <div class="onb-step" id="onb-welcome">
+        <span class="onb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M8.5 4v16"/></svg></span>
+        <div class="onb-h">Welcome to Tastebuds</div>
+        <p class="onb-p">Rate the films you've seen — Tastebuds learns your taste and starts recommending films you'll actually love.</p>
+        <p class="onb-note">Everything stays on your computer. Your ratings are plain files you own — no account, no cloud.</p>
+        <div class="onb-row" style="justify-content:flex-end"><button class="pbtn primary" id="onb-start">Get started</button></div>
+      </div>
+
+      <div class="onb-step" id="onb-key">
+        <span class="onb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 20 3M16 7l3 3M14.5 8.5l2.5 2.5"/></svg></span>
+        <div class="onb-h">Connect The Movie Database</div>
+        <p class="onb-p">Tastebuds uses TMDb for posters, cast, and details. Paste your free API key to begin.</p>
+        <input class="onb-field" id="onb-key-input" placeholder="TMDb API key (v3 auth)" autocomplete="off">
+        <div class="onb-err" id="onb-key-err"></div>
+        <p class="onb-note"><a class="link" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">How to get one — about 2 minutes</a> · saved only on your machine, in tmdb_key.txt</p>
+        <div class="onb-row"><button class="pbtn cancel" id="onb-key-back">Back</button><button class="pbtn primary" id="onb-key-continue">Continue</button></div>
+      </div>
+
+      <div class="onb-step" id="onb-channel">
+        <span class="onb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="14" width="7" height="7" rx="1.4"/><rect x="3" y="14" width="7" height="7" rx="1.4"/></svg></span>
+        <div class="onb-h">Make your first channel</div>
+        <p class="onb-p">Channels are where your movies come from. The easiest start: name a film you love, and Tastebuds builds a channel of films like it.</p>
+        <input class="onb-field" id="onb-q" placeholder="Search a film you love — e.g. Aftersun" autocomplete="off">
+        <div class="picker" id="onb-res"></div>
+        <div class="onb-picked" id="onb-picked"></div>
+        <p class="onb-note">We'll also count it as a film you liked, to give your recommendations a head start.</p>
+        <div class="onb-row"><button class="onb-skip" id="onb-self">Set up channels myself</button><button class="pbtn primary" id="onb-create" disabled>Create channel</button></div>
+      </div>
+
+      <div class="onb-step" id="onb-rate">
+        <span class="onb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3l2.6 5.6 6 .8-4.4 4.2 1.1 6L12 16.8 6.7 19.6l1.1-6L3.4 9.4l6-.8z"/></svg></span>
+        <div class="onb-h">How rating works</div>
+        <p class="onb-p">You'll see one film at a time. For each, tell Tastebuds:</p>
+        <div class="onb-verd"><span class="vd" style="background:var(--teal)"></span><b>Liked</b> · seen and loved it</div>
+        <div class="onb-verd"><span class="vd" style="background:var(--amber)"></span><b>Indifferent</b> · seen, didn't stick</div>
+        <div class="onb-verd"><span class="vd" style="background:var(--coral)"></span><b>Disliked</b> · seen and disliked</div>
+        <div class="onb-verd" style="margin-bottom:10px"><span class="vd" style="background:var(--graphite)"></span><b>Not seen</b> · haven't watched it</div>
+        <div class="onb-tip">Tip: rate films you didn't love, too — the dislikes are what sharpen your recommendations.</div>
+        <div class="onb-row"><button class="pbtn cancel" id="onb-rate-back">Back</button><button class="pbtn primary" id="onb-finish">Start rating</button></div>
+      </div>
+
     </div>
   </div>
 
@@ -1261,62 +1554,183 @@ async function undo(){
   render(d); busy=false;
 }
 
-/* ---- Channels panel ---- */
-function genreName(id){ const g=genreList.find(x=>x.id===id); return g?g.name:('#'+id); }
+/* ---- Channels panel (kinds: genre / movie / person / keyword) ---- */
+let kChosen = [];          // chosen keyword tags [{id,name}] for the Keyword card
+let kMatch = 'any', kStyle = 'popular';
+let editIndex = null;      // index in chDraft being edited (null = adding new)
+let searchTimer = null;
 
+const ICN = {
+  genre:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="3" width="7" height="7" rx="1.4"/><rect x="14" y="14" width="7" height="7" rx="1.4"/><rect x="3" y="14" width="7" height="7" rx="1.4"/></svg>',
+  movie:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M8.5 4v16"/></svg>',
+  person:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8.5" r="3.7"/><path d="M5 20c0-3.6 3.2-5.5 7-5.5s7 1.9 7 5.5"/></svg>',
+  keyword:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.6 13.4 12.8 21.2a1.8 1.8 0 0 1-2.6 0L3 14V4h10l7.6 7.4a1.8 1.8 0 0 1 0 2z"/><circle cx="7.5" cy="7.5" r="1.4"/></svg>'
+};
+const EDIT_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2 2 0 0 1 3 3L7.3 18.7 3 20l1.3-4.3z"/></svg>';
+const TRASH_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M18 7l-1 13H7L6 7"/></svg>';
+
+function genreName(id){ const g=genreList.find(x=>x.id===id); return g?g.name:('#'+id); }
+function dispKind(c){ if(c.kind==='movie')return 'movie'; if(c.kind==='person')return 'person'; if((c.keywords||[]).length) return 'keyword'; return 'genre'; }
 function chSummary(c){
-  const gs = (c.genres||[]).map(genreName).join(', ');
-  const kw = (c.keywords||[]).join(', ');
-  const parts = [];
-  if(gs) parts.push(gs);
-  if(kw) parts.push('"'+kw+'"');
-  parts.push((c.style||'custom'));
+  if(c.kind==='movie') return 'Seed film';
+  if(c.kind==='person') return 'Person · cast or crew';
+  const parts=[];
+  const gs=(c.genres||[]).map(genreName).join(', '); if(gs) parts.push(gs);
+  const kw=(c.keywords||[]); if(kw.length){ parts.push('“'+kw.join('”, “')+'”'); if(kw.length>1) parts.push(c.match==='any'?'any':'all'); }
+  parts.push(c.style||'custom');
   return parts.join(' · ');
 }
-
 function renderChannels(){
-  const list = document.getElementById('ch-list');
+  const list=document.getElementById('ch-list');
+  if(!chDraft.length){ list.innerHTML='<div class="chlist-empty">No channels yet — add one below.</div>'; return; }
   list.innerHTML = chDraft.map((c,i)=>
-    '<div class="ch">'+
-      '<input type="checkbox" '+(c.enabled?'checked':'')+' onchange="chToggle('+i+',this.checked)">'+
-      '<div class="info"><div class="cn">'+esc(c.name)+'</div>'+
-        '<div class="cs">'+esc(chSummary(c))+'</div></div>'+
-      '<button class="del" onclick="chDelete('+i+')">Remove</button>'+
-    '</div>').join('') || '<div class="note">No channels yet — add one below.</div>';
+    '<div class="ch" data-i="'+i+'">'+
+      '<span class="ic">'+ICN[dispKind(c)]+'</span>'+
+      '<div class="info"><div class="cn">'+esc(c.name)+'</div><div class="cs">'+esc(chSummary(c))+'</div></div>'+
+      '<button class="sw'+(c.enabled?' on':'')+'" data-tgl="'+i+'" aria-label="Toggle channel"></button>'+
+      '<button class="iconbtn" data-edit="'+i+'" aria-label="Edit name">'+EDIT_SVG+'</button>'+
+      '<button class="iconbtn" data-del="'+i+'" aria-label="Remove">'+TRASH_SVG+'</button>'+
+    '</div>').join('');
+  list.querySelectorAll('[data-tgl]').forEach(b=>b.onclick=()=>{ const i=+b.dataset.tgl; chDraft[i].enabled=!chDraft[i].enabled; b.classList.toggle('on',chDraft[i].enabled); });
+  list.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{ chDraft.splice(+b.dataset.del,1); renderChannels(); });
+  list.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>startEdit(+b.dataset.edit));
 }
-function chToggle(i,on){ chDraft[i].enabled = on; }
-function chDelete(i){ chDraft.splice(i,1); renderChannels(); }
 
+/* genre card */
 function renderGenrePicker(){
-  const wrap = document.getElementById('ch-genres');
-  if(!genreList.length){ wrap.innerHTML='<div class="note">Genre list needs a TMDb key. Keyword-only channels still work.</div>'; return; }
-  wrap.innerHTML = genreList.map(g=>
-    '<span class="gchip'+(addSel.has(g.id)?' on':'')+'" onclick="gToggle('+g.id+',this)">'+esc(g.name)+'</span>').join('');
+  const wrap=document.getElementById('g-genres');
+  if(!genreList.length){ wrap.innerHTML='<div class="note">Genre list needs a TMDb key.</div>'; return; }
+  wrap.innerHTML = genreList.map(g=>'<span class="gchip'+(addSel.has(g.id)?' on':'')+'" data-g="'+g.id+'">'+esc(g.name)+'</span>').join('');
+  wrap.querySelectorAll('[data-g]').forEach(el=>el.onclick=()=>{ const id=+el.dataset.g;
+    if(addSel.has(id)){addSel.delete(id);el.classList.remove('on');}else{addSel.add(id);el.classList.add('on');} });
 }
-function gToggle(id,el){ if(addSel.has(id)){addSel.delete(id);el.classList.remove('on');} else {addSel.add(id);el.classList.add('on');} }
+function gAdd(){
+  const genres=[...addSel];
+  if(!genres.length){ document.getElementById('g-note').textContent='Pick at least one genre.'; return; }
+  const name=document.getElementById('g-name').value.trim();
+  const preset=STYLES[addStyle];
+  const auto=genres.map(genreName).join(' / ')||'Genre';
+  commitChannel({kind:'discover', name:name||auto, enabled:true, genres:genres, keywords:[], match:'all',
+                 style:addStyle, sort:preset.sort, vote_count_gte:preset.vote_count_gte, vote_avg_gte:preset.vote_avg_gte});
+  document.getElementById('g-name').value=''; document.getElementById('g-note').textContent='';
+  addSel=new Set(); renderGenrePicker();
+}
 
-function chAdd(){
-  const name = document.getElementById('ch-name').value.trim();
-  const kw = document.getElementById('ch-kw').value.split(',').map(s=>s.trim()).filter(Boolean);
-  const genres = [...addSel];
-  if(!kw.length && !genres.length){ document.getElementById('ch-note').textContent='Add at least one keyword or genre.'; return; }
-  const preset = STYLES[addStyle];
-  const auto = genres.map(genreName).concat(kw).slice(0,3).join(' / ') || 'Channel';
-  chDraft.push({name:name||auto, enabled:true, genres, keywords:kw, style:addStyle,
-                sort:preset.sort, vote_count_gte:preset.vote_count_gte, vote_avg_gte:preset.vote_avg_gte});
-  document.getElementById('ch-name').value='';
-  document.getElementById('ch-kw').value='';
-  document.getElementById('ch-note').textContent='';
-  addSel.clear(); renderGenrePicker(); renderChannels();
+/* generic picker (movie / person / keyword search results) */
+function renderPicker(boxId, items, onPick){
+  const box=document.getElementById(boxId);
+  if(!items.length){ box.innerHTML=''; return; }
+  box.innerHTML=items.map((it,idx)=>'<div class="pk" data-idx="'+idx+'"><span>'+esc(it.label)+'</span>'+(it.meta?'<span class="meta">'+esc(it.meta)+'</span>':'')+'</div>').join('');
+  box.querySelectorAll('.pk').forEach(el=>el.onclick=()=>onPick(items[+el.dataset.idx]));
+}
+function debounceSearch(el, fn){ if(!el) return; el.oninput=()=>{ clearTimeout(searchTimer); searchTimer=setTimeout(fn,260); }; }
+
+/* movie seed card */
+async function doMovieSearch(){
+  const q=document.getElementById('m-q').value.trim();
+  if(!q){ document.getElementById('m-res').innerHTML=''; return; }
+  let d; try{ d=await (await fetch('/api/search-movie?q='+encodeURIComponent(q))).json(); }catch(e){ return; }
+  renderPicker('m-res',(d.results||[]).map(m=>({raw:m,label:m.title,meta:(m.year||'')+(m.rating?(' · '+m.rating+' ★'):'')})),pickMovie);
+}
+function pickMovie(it){ const m=it.raw;
+  commitChannel({kind:'movie', name:'More like '+m.title, enabled:true, movie_id:m.id, movie_title:m.title,
+                 style:'custom', sort:'popularity.desc', vote_count_gte:0, vote_avg_gte:0});
+  document.getElementById('m-q').value=''; document.getElementById('m-res').innerHTML='';
+}
+
+/* person card */
+async function doPersonSearch(){
+  const q=document.getElementById('p-q').value.trim();
+  if(!q){ document.getElementById('p-res').innerHTML=''; return; }
+  let d; try{ d=await (await fetch('/api/search-person?q='+encodeURIComponent(q))).json(); }catch(e){ return; }
+  renderPicker('p-res',(d.results||[]).map(p=>({raw:p,label:p.name,meta:p.dept||''})),pickPerson);
+}
+function pickPerson(it){ const p=it.raw; const preset=STYLES['popular'];
+  commitChannel({kind:'person', name:'Films by '+p.name, enabled:true, person_id:p.id, person_name:p.name,
+                 style:'popular', sort:preset.sort, vote_count_gte:preset.vote_count_gte, vote_avg_gte:preset.vote_avg_gte});
+  document.getElementById('p-q').value=''; document.getElementById('p-res').innerHTML='';
+}
+
+/* keyword card */
+function renderChosen(){
+  const box=document.getElementById('k-chosen');
+  box.innerHTML=kChosen.map((k,i)=>'<span class="ktag">'+esc(k.name)+'<span class="kx" data-kx="'+i+'">×</span></span>').join('');
+  box.querySelectorAll('[data-kx]').forEach(el=>el.onclick=()=>{ kChosen.splice(+el.dataset.kx,1); renderChosen(); });
+}
+async function doKeywordSearch(){
+  const q=document.getElementById('k-q').value.trim();
+  if(!q){ document.getElementById('k-res').innerHTML=''; return; }
+  let d; try{ d=await (await fetch('/api/search-keyword?q='+encodeURIComponent(q))).json(); }catch(e){ return; }
+  renderPicker('k-res',(d.results||[]).map(k=>({raw:k,label:k.name,meta:(k.count!=null?(k.count.toLocaleString()+' films'):'')})),pickKeyword);
+}
+function pickKeyword(it){ const k=it.raw; if(!kChosen.some(x=>x.name===k.name)) kChosen.push({id:k.id,name:k.name});
+  document.getElementById('k-q').value=''; document.getElementById('k-res').innerHTML=''; renderChosen(); }
+function kAdd(){
+  if(!kChosen.length){ document.getElementById('k-note').textContent='Pick at least one keyword.'; return; }
+  const name=document.getElementById('k-name').value.trim();
+  const preset=STYLES[kStyle];
+  const kws=kChosen.map(k=>k.name);
+  commitChannel({kind:'discover', name:name||kws.slice(0,3).join(' / '), enabled:true, genres:[], keywords:kws,
+                 match:kMatch, style:kStyle, sort:preset.sort, vote_count_gte:preset.vote_count_gte, vote_avg_gte:preset.vote_avg_gte});
+  document.getElementById('k-name').value=''; document.getElementById('k-note').textContent='';
+  kChosen=[]; renderChosen();
+}
+
+/* commit (add new, or replace when editing) */
+function commitChannel(obj){
+  if(editIndex!=null){ obj.enabled=chDraft[editIndex].enabled; chDraft[editIndex]=obj; editIndex=null;
+    document.getElementById('g-add').textContent='Add channel'; document.getElementById('k-add').textContent='Add channel'; }
+  else { chDraft.push(obj); }
+  renderChannels();
+}
+
+/* edit: genre/keyword reopen their card prefilled; movie/person rename inline */
+function setSeg(segId, val, attr){ document.querySelectorAll('#'+segId+' button').forEach(b=>b.classList.toggle('on', b.dataset[attr]===val)); }
+function openCard(kind){ const el=document.getElementById('card-'+kind); if(el) el.classList.add('open'); }
+function closeCards(){ document.querySelectorAll('#add-cards .acard').forEach(c=>c.classList.remove('open')); }
+function startEdit(i){
+  const c=chDraft[i], k=dispKind(c);
+  if(k==='movie'||k==='person'){ inlineRename(i); return; }
+  editIndex=i; closeCards();
+  if(k==='genre'){
+    openCard('genre');
+    document.getElementById('g-name').value=c.name||'';
+    addSel=new Set(c.genres||[]); addStyle=(c.style&&STYLES[c.style])?c.style:'popular';
+    setSeg('g-style',addStyle,'s'); renderGenrePicker();
+    document.getElementById('g-add').textContent='Update channel';
+    document.getElementById('card-genre').scrollIntoView({block:'nearest'});
+  } else {
+    openCard('keyword');
+    document.getElementById('k-name').value=c.name||'';
+    kChosen=(c.keywords||[]).map(n=>({id:null,name:n})); renderChosen();
+    kMatch=(c.match==='all')?'all':'any'; kStyle=(c.style&&STYLES[c.style])?c.style:'popular';
+    setSeg('k-match',kMatch,'m'); setSeg('k-style',kStyle,'s');
+    document.getElementById('k-add').textContent='Update channel';
+    document.getElementById('card-keyword').scrollIntoView({block:'nearest'});
+  }
+}
+function inlineRename(i){
+  const row=document.querySelector('.ch[data-i="'+i+'"]'); if(!row) return;
+  const cn=row.querySelector('.cn'), cur=chDraft[i].name;
+  cn.innerHTML='<input class="nm-in" value="'+escAttr(cur)+'">';
+  const inp=cn.querySelector('input'); inp.focus(); inp.select();
+  let done=false;
+  const finish=(save)=>{ if(done) return; done=true; if(save){ const v=inp.value.trim(); if(v) chDraft[i].name=v; } renderChannels(); };
+  inp.onblur=()=>finish(true);
+  inp.onkeydown=(e)=>{ if(e.key==='Enter') finish(true); else if(e.key==='Escape') finish(false); };
 }
 
 async function openSettings(){
-  const r = await fetch('/api/channels'); const d = await r.json();
-  chDraft = JSON.parse(JSON.stringify(d.channels||[]));
-  genreList = d.genres||[];
-  addSel.clear(); addStyle='popular';
-  document.querySelectorAll('#ch-style button').forEach(b=>b.classList.toggle('on', b.dataset.s==='popular'));
-  renderChannels(); renderGenrePicker();
+  const r=await fetch('/api/channels'); const d=await r.json();
+  chDraft=JSON.parse(JSON.stringify(d.channels||[]));
+  genreList=d.genres||[];
+  editIndex=null;
+  document.getElementById('g-add').textContent='Add channel'; document.getElementById('k-add').textContent='Add channel';
+  addSel=new Set(); addStyle='popular'; kChosen=[]; kMatch='any'; kStyle='popular';
+  ['g-name','k-name','m-q','p-q','k-q'].forEach(id=>{const el=document.getElementById(id); if(el) el.value='';});
+  ['m-res','p-res','k-res','g-note','k-note','k-chosen'].forEach(id=>{const el=document.getElementById(id); if(el) el.innerHTML='';});
+  setSeg('g-style','popular','s'); setSeg('k-style','popular','s'); setSeg('k-match','any','m');
+  closeCards(); renderGenrePicker(); renderChannels();
   document.getElementById('overlay').classList.add('open'); settingsOpen=true;
 }
 function closeSettings(){ document.getElementById('overlay').classList.remove('open'); settingsOpen=false; }
@@ -1330,11 +1744,16 @@ document.getElementById('open-settings').onclick = openSettings;
 document.getElementById('close-settings').onclick = closeSettings;
 document.getElementById('ch-cancel').onclick = closeSettings;
 document.getElementById('ch-save').onclick = saveChannels;
-document.getElementById('ch-add').onclick = chAdd;
 document.getElementById('overlay').onclick = e=>{ if(e.target.id==='overlay') closeSettings(); };
-document.querySelectorAll('#ch-style button').forEach(b=>{
-  b.onclick = ()=>{ addStyle=b.dataset.s; document.querySelectorAll('#ch-style button').forEach(x=>x.classList.toggle('on',x===b)); };
-});
+document.querySelectorAll('#add-cards .ahead').forEach(h=>h.onclick=()=>h.parentElement.classList.toggle('open'));
+document.getElementById('g-add').onclick = gAdd;
+document.getElementById('k-add').onclick = kAdd;
+debounceSearch(document.getElementById('m-q'), doMovieSearch);
+debounceSearch(document.getElementById('p-q'), doPersonSearch);
+debounceSearch(document.getElementById('k-q'), doKeywordSearch);
+document.querySelectorAll('#g-style button').forEach(b=>b.onclick=()=>{ addStyle=b.dataset.s; setSeg('g-style',addStyle,'s'); });
+document.querySelectorAll('#k-style button').forEach(b=>b.onclick=()=>{ kStyle=b.dataset.s; setSeg('k-style',kStyle,'s'); });
+document.querySelectorAll('#k-match button').forEach(b=>b.onclick=()=>{ kMatch=b.dataset.m; setSeg('k-match',kMatch,'m'); });
 document.getElementById('undo').onclick = undo;
 
 document.addEventListener('keydown', e=>{
@@ -1685,12 +2104,84 @@ if(window.ResizeObserver){
 window.addEventListener('resize', sizeFlip);
 setTimeout(sizeFlip, 60);
 
-loadNext();
-(async function initRecommender(){
+/* ---- First-run onboarding ---- */
+let onbSeed=null, onbSteps=[], onbIdx=0, onboardingActive=false, onbSearchTimer=null;
+function onbShow(){
+  document.querySelectorAll('#onb-overlay .onb-step').forEach(s=>s.classList.remove('on'));
+  const el=document.getElementById('onb-'+onbSteps[onbIdx]); if(el) el.classList.add('on');
+  document.getElementById('onb-dots').innerHTML = onbSteps.map((s,i)=>'<span class="odot'+(i<=onbIdx?' on':'')+'"></span>').join('');
+  document.getElementById('onb-count').textContent = 'Step '+(onbIdx+1)+' of '+onbSteps.length;
+}
+function onbNext(){ if(onbIdx<onbSteps.length-1){ onbIdx++; onbShow(); } }
+function onbBack(){ if(onbIdx>0){ onbIdx--; onbShow(); } }
+function onbOpen(showKey){
+  onbSteps = showKey ? ['welcome','key','channel','rate'] : ['welcome','channel','rate'];
+  onbIdx=0; onbSeed=null;
+  document.getElementById('onb-create').disabled=true;
+  document.getElementById('onb-picked').textContent='';
+  document.getElementById('onb-res').innerHTML='';
+  document.getElementById('onb-key-input').value='';
+  document.getElementById('onb-q').value='';
+  document.getElementById('onb-overlay').classList.add('open');
+  onbShow();
+}
+function onbCloseOverlay(){ document.getElementById('onb-overlay').classList.remove('open'); onboardingActive=false; }
+
+async function onbSaveKey(){
+  const err=document.getElementById('onb-key-err');
+  const key=document.getElementById('onb-key-input').value.trim();
+  if(!key){ err.textContent='Paste your key to continue.'; return; }
+  err.textContent='Checking…';
+  let d; try{ d=await (await fetch('/api/set-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key})})).json(); }
+  catch(e){ err.textContent='Could not reach the app. Is it still running?'; return; }
+  if(!d.ok){ err.textContent=d.error||'That key didn’t work.'; return; }
+  err.textContent=''; onbNext();
+}
+async function onbSearch(){
+  const q=document.getElementById('onb-q').value.trim(), box=document.getElementById('onb-res');
+  if(!q){ box.innerHTML=''; return; }
+  let d; try{ d=await (await fetch('/api/search-movie?q='+encodeURIComponent(q))).json(); }catch(e){ return; }
+  const list=d.results||[];
+  box.innerHTML=list.map((m,i)=>'<div class="pk" data-i="'+i+'"><span>'+esc(m.title)+'</span><span class="meta">'+(m.year||'')+(m.rating?(' · '+m.rating+' ★'):'')+'</span></div>').join('');
+  box.querySelectorAll('.pk').forEach(el=>el.onclick=()=>{
+    onbSeed=list[+el.dataset.i];
+    document.getElementById('onb-q').value=onbSeed.title; box.innerHTML='';
+    document.getElementById('onb-picked').textContent='Selected: '+onbSeed.title+(onbSeed.year?(' ('+onbSeed.year+')'):'');
+    document.getElementById('onb-create').disabled=false;
+  });
+}
+async function onbCreate(){
+  if(!onbSeed) return;
+  const btn=document.getElementById('onb-create'); btn.disabled=true; btn.textContent='Creating…';
+  const ch={kind:'movie', name:'More like '+onbSeed.title, enabled:true, movie_id:onbSeed.id, movie_title:onbSeed.title, style:'custom', sort:'popularity.desc', vote_count_gte:0, vote_avg_gte:0};
+  try{ await fetch('/api/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channels:[ch]})}); }catch(e){}
+  const mv={id:onbSeed.id, title:onbSeed.title, year:onbSeed.year||'', genres:'', link:'https://www.themoviedb.org/movie/'+onbSeed.id};
+  try{ const r=await fetch('/api/rate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rating:3, movie:mv, stack:false})}); const d=await r.json(); if(d.stats) setTally(d.stats); }catch(e){}
+  btn.textContent='Create channel';
+  onbNext();
+}
+function onbFinish(){ onbCloseOverlay(); loadNext(); nextRec(); }
+function onbSetupSelf(){ onbCloseOverlay(); loadNext(); openSettings(); }
+
+document.getElementById('onb-start').onclick = onbNext;
+document.getElementById('onb-key-continue').onclick = onbSaveKey;
+document.getElementById('onb-key-back').onclick = onbBack;
+document.getElementById('onb-key-input').addEventListener('keydown', e=>{ if(e.key==='Enter') onbSaveKey(); });
+document.getElementById('onb-q').oninput = ()=>{ clearTimeout(onbSearchTimer); onbSearchTimer=setTimeout(onbSearch,260); };
+document.getElementById('onb-create').onclick = onbCreate;
+document.getElementById('onb-self').onclick = onbSetupSelf;
+document.getElementById('onb-rate-back').onclick = onbBack;
+document.getElementById('onb-finish').onclick = onbFinish;
+document.getElementById('onb-overlay').onclick = e=>{ if(e.target.id==='onb-overlay'){ onbCloseOverlay(); loadNext(); } };
+
+(async function boot(){
+  let st={}; try{ st=await (await fetch('/api/state')).json(); }catch(e){}
+  onboardingActive = !!st.needs_onboarding;   // only on a genuinely fresh install
+  if(onboardingActive){ onbOpen(!st.has_key); } else { loadNext(); }
   try { recProfile = localStorage.getItem('recProfile') || 'you'; } catch(e){}
-  await refreshFriends();   // populates the profile dropdown; resets to 'you' if that friend is gone
+  await refreshFriends();
   const sel = document.getElementById('profile-select'); if(sel) sel.value = recProfile;
-  nextRec();                // auto-produce the first batch on startup
+  if(!onboardingActive) nextRec();
 })();
 </script>
 </body></html>
@@ -1747,6 +2238,20 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
             self._send(200, json.dumps({"results": find_movies(q)}))
+        elif self.path.startswith("/api/search-movie"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            self._send(200, json.dumps({"results": search_movies(q)}))
+        elif self.path.startswith("/api/search-person"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            self._send(200, json.dumps({"results": search_people(q)}))
+        elif self.path.startswith("/api/search-keyword"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            self._send(200, json.dumps({"results": search_keywords(q)}))
+        elif self.path.startswith("/api/state"):
+            self._send(200, json.dumps({"needs_onboarding": needs_onboarding(), "has_key": bool(API_KEY)}))
         elif self.path.startswith("/api/likes"):
             self._send(200, json.dumps({"likes": liked_export()}))
         elif self.path.startswith("/api/friends"):
@@ -1833,6 +2338,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"error": str(e)}))
                 return
             self._send(200, json.dumps({"ok": True, "stats": stats()}))
+
+        elif self.path.startswith("/api/set-key"):
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+                ok, msg = save_api_key(body.get("key", ""))
+            except Exception as e:
+                self._send(400, json.dumps({"ok": False, "error": str(e)}))
+                return
+            self._send(200, json.dumps({"ok": True} if ok else {"ok": False, "error": msg}))
 
         elif self.path.startswith("/api/rebuild-cache"):
             ok, data = run_recommender(["--train-only", "--rebuild-cache"])
@@ -1934,7 +2448,7 @@ def main():
         print("          export TMDB_API_KEY=your_key_here")
         print("        Free key: https://www.themoviedb.org/settings/api")
         print("        Starting anyway so you can see the UI.\n")
-    load_channels()  # ensure channels.json exists
+    load_channels()  # (fresh installs have none yet; onboarding/UI creates the first)
     # one-time migration: dismissed.md -> not-interested.md (keeps your existing data)
     if not os.path.exists(NOT_INTERESTED_PATH) and os.path.exists(NOT_INTERESTED_LEGACY_PATH):
         try:
