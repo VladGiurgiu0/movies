@@ -20,8 +20,6 @@ by [The Movie Database (TMDb)](https://www.themoviedb.org). The rater itself use
 only the Python standard library; the optional recommender adds a single
 dependency (NumPy).
 
-Follow the build: [**@tastebuds.film**](https://instagram.com/tastebuds.film)
-
 ## Features
 
 - **One-at-a-time rating** with a clean, minimal UI (automatic light/dark),
