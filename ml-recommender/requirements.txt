@@ -1,0 +1,6 @@
+# Core pipeline — that's all you need to train and get recommendations.
+numpy>=1.23
+
+# Optional: only for exporting the trained model to Core ML for on-device
+# (iPhone / Mac) inference. Install when you want export_coreml.py.
+# coremltools>=7.0

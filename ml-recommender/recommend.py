@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""
+recommend.py — a personal movie recommender trained on your own ratings.
+
+Reads ../movies.md and ../watchlist.md, enriches each film with TMDb metadata
+(genres, keywords, director, cast, language, year, rating), learns what you
+like, and ranks candidate films by predicted affinity.
+
+Candidates come, by default, from **fresh TMDb discover** across your enabled
+channels (reusing tastebuds.py), excluding anything already in movies.md,
+watchlist.md, or not-interested.md. With --source shortlist (or when offline) it
+ranks the "not seen" (0) films already in movies.md instead.
+
+Model selection is automatic:
+  • few labels  -> rank by content similarity to your liked set (cold start)
+  • enough labels -> a compact NumPy logistic-regression model predicting P(like),
+    with cross-validated ROC-AUC / AP and interpretable taste drivers.
+
+Why a linear model (not TensorFlow/PyTorch): at this data scale it generalizes
+better, trains in milliseconds on a modern laptop, is interpretable, and exports
+directly to Core ML for on-device inference. See README.md.
+
+USAGE
+    pip install -r requirements.txt          # numpy
+    python3 recommend.py                      # discover-based recs -> recommendations.md
+    python3 recommend.py --n 20
+    python3 recommend.py --source shortlist   # rank your existing 0-shortlist
+    python3 recommend.py --train-only         # just train + report metrics
+    python3 recommend.py --json               # machine-readable (used by the rater UI)
+"""
+
+import os
+import sys
+import json
+import math
+import random
+import hashlib
+import tempfile
+import argparse
+from datetime import date
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+for p in (HERE, ROOT):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import tmdb_features as tf  # noqa: E402
+try:
+    import tastebuds as rater   # reused (stdlib only) for channel discovery + dedupe
+except Exception:
+    rater = None
+
+MOVIES = os.path.join(ROOT, "movies.md")
+WATCH = os.path.join(ROOT, "watchlist.md")
+NOT_INTERESTED = os.path.join(ROOT, "not-interested.md")
+NOT_INTERESTED_LEGACY = os.path.join(ROOT, "dismissed.md")  # pre-rename fallback
+CACHE = os.path.join(HERE, "features_cache.json")
+MODEL_PATH = os.path.join(HERE, "model.json")
+OUT = os.path.join(HERE, "recommendations.md")
+FRIENDS_PATH = os.path.join(ROOT, "friends.json")   # multi-friend list [{name, likes}]
+FRIEND_PATH = os.path.join(ROOT, "friend.json")     # legacy single-friend file
+IMG_BASE = "https://image.tmdb.org/t/p/w500"
+
+MIN_POS_FOR_MODEL = 8
+MIN_NEG_FOR_MODEL = 5
+POOL_CAP = 40  # how many fresh discover candidates to score
+
+
+# --------------------------------------------------------------------------
+# Parse the Markdown tables
+# --------------------------------------------------------------------------
+def _rows(path):
+    """Data rows between the TABLE-START / TABLE-END markers only."""
+    if not os.path.exists(path):
+        return []
+    out = []
+    inside = False
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if "TABLE-START" in line:
+                inside = True
+                continue
+            if "TABLE-END" in line:
+                break
+            if inside and line.strip().startswith("|"):
+                out.append([c.strip() for c in line.strip().strip("|").split("|")])
+    return out
+
+
+def _split_genres(s):
+    return [g.strip() for g in s.split(",") if g.strip()]
+
+
+def load_movies(path=None):
+    path = path or MOVIES
+    items = []
+    for c in _rows(path):
+        # | Rating | Status | Title | Year | Genres | TMDb ID | Link | Rated on |
+        if len(c) >= 7 and c[0] in {"0", "1", "2", "3"} and c[5].isdigit():
+            items.append({"id": int(c[5]), "rating": int(c[0]), "title": c[2],
+                          "year": c[3], "genres": _split_genres(c[4]), "link": c[6],
+                          "poster": "", "overview": ""})
+    return items
+
+
+def load_watchlist(path=None):
+    path = path or WATCH
+    items = []
+    for c in _rows(path):
+        # | Title | Year | Genres | TMDb ID | Link | Added on |
+        if len(c) >= 5 and c[3].isdigit():
+            items.append({"id": int(c[3]), "rating": None, "title": c[0],
+                          "year": c[1], "genres": _split_genres(c[2]), "link": c[4]})
+    return items
+
+
+def not_interested_ids(path=None):
+    path = path or (NOT_INTERESTED if os.path.exists(NOT_INTERESTED) else NOT_INTERESTED_LEGACY)
+    ids = set()
+    for c in _rows(path):
+        if len(c) >= 4 and c[3].isdigit():
+            ids.add(int(c[3]))
+    return ids
+
+
+# --------------------------------------------------------------------------
+# Feature engineering
+# --------------------------------------------------------------------------
+def base_features(m):
+    f = {}
+    for g in m.get("genres", []):
+        f["genre=" + g] = 1.0
+    y = str(m.get("year") or "")
+    if y.isdigit():
+        yr = int(y)
+        f["decade=%d" % (yr // 10 * 10)] = 1.0
+        f["year"] = (yr - 2000) / 25.0
+    return f
+
+
+def meta_features(meta):
+    f = {}
+    for k in (meta.get("keywords") or [])[:12]:
+        f["kw=" + k] = 1.0
+    if meta.get("director"):
+        f["dir=" + meta["director"]] = 1.0
+    for p in (meta.get("cast") or [])[:5]:
+        f["cast=" + p] = 1.0
+    if meta.get("lang"):
+        f["lang=" + meta["lang"]] = 1.0
+    if meta.get("vote_average"):
+        f["vote_avg"] = float(meta["vote_average"]) / 10.0
+    if meta.get("runtime"):
+        f["runtime"] = float(meta["runtime"]) / 120.0
+    if meta.get("popularity"):
+        f["log_pop"] = math.log1p(float(meta["popularity"])) / 5.0
+    return f
+
+
+def featurize(m, metas):
+    f = base_features(m)
+    f.update(meta_features(metas.get(m["id"], {})))
+    return f
+
+
+class Vectorizer:
+    def __init__(self, vocab=None):
+        self.vocab = list(vocab) if vocab else []
+        self.idx = {k: i for i, k in enumerate(self.vocab)}
+
+    def fit(self, dicts):
+        keys = set()
+        for d in dicts:
+            keys.update(d.keys())
+        self.vocab = sorted(keys)
+        self.idx = {k: i for i, k in enumerate(self.vocab)}
+        return self
+
+    def transform(self, dicts):
+        X = np.zeros((len(dicts), len(self.vocab)), dtype=float)
+        for i, d in enumerate(dicts):
+            for k, v in d.items():
+                j = self.idx.get(k)
+                if j is not None:
+                    X[i, j] = v
+        return X
+
+
+# --------------------------------------------------------------------------
+# Metrics + model (NumPy)
+# --------------------------------------------------------------------------
+def roc_auc(y, s):
+    y = np.asarray(y); s = np.asarray(s, dtype=float)
+    if (y == 1).sum() == 0 or (y == 0).sum() == 0:
+        return float("nan")
+    order = np.argsort(s, kind="mergesort")
+    ranks = np.empty(len(s)); ranks[order] = np.arange(1, len(s) + 1)
+    ss = s[order]; i = 0
+    while i < len(ss):
+        j = i
+        while j + 1 < len(ss) and ss[j + 1] == ss[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = (i + 1 + j + 1) / 2.0
+        i = j + 1
+    n_pos = (y == 1).sum(); n_neg = (y == 0).sum()
+    return (ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def average_precision(y, s):
+    y = np.asarray(y); s = np.asarray(s, dtype=float)
+    if y.sum() == 0:
+        return float("nan")
+    order = np.argsort(-s, kind="mergesort"); y = y[order]
+    tp = np.cumsum(y); precision = tp / (np.arange(len(y)) + 1)
+    return float((precision * (y / y.sum())).sum())
+
+
+def train_logreg(X, y, w=None, l2=1.0, iters=4000, lr=0.5, class_balance=True):
+    X = np.asarray(X, float); y = np.asarray(y, float)
+    mu = X.mean(0); sd = X.std(0); sd[sd < 1e-8] = 1.0
+    Xs = (X - mu) / sd
+    n, d = Xs.shape
+    Xb = np.hstack([Xs, np.ones((n, 1))])
+    theta = np.zeros(d + 1)
+    w = np.ones(n) if w is None else np.asarray(w, float).copy()
+    if class_balance:                       # so the minority class isn't drowned out
+        pos = (y == 1).sum(); neg = (y == 0).sum()
+        if pos > 0 and neg > 0:
+            w = w * np.where(y == 1, (pos + neg) / (2.0 * pos), (pos + neg) / (2.0 * neg))
+    w = w / w.mean()
+    for _ in range(iters):
+        p = 1.0 / (1.0 + np.exp(-np.clip(Xb @ theta, -30, 30)))
+        grad = Xb.T @ ((p - y) * w) / n
+        grad[:-1] += (l2 / n) * theta[:-1]
+        theta -= lr * grad
+    return {"theta": theta.tolist(), "mu": mu.tolist(), "sd": sd.tolist()}
+
+
+def proba(model, X):
+    X = np.asarray(X, float)
+    mu = np.array(model["mu"]); sd = np.array(model["sd"]); theta = np.array(model["theta"])
+    Xb = np.hstack([(X - mu) / sd, np.ones((len(X), 1))])
+    return 1.0 / (1.0 + np.exp(-np.clip(Xb @ theta, -30, 30)))
+
+
+def stratified_folds(y, k, seed=0):
+    rng = np.random.default_rng(seed)
+    folds = [[] for _ in range(k)]
+    for cls in (0, 1):
+        idx = np.where(np.asarray(y) == cls)[0]; rng.shuffle(idx)
+        for i, v in enumerate(idx):
+            folds[i % k].append(int(v))
+    return [np.array(sorted(f)) for f in folds]
+
+
+def rank_with_explore(scores, n, explore):
+    """Safe (explore~0) = top scores; higher explore = softmax sampling for variety."""
+    scores = np.asarray(scores, dtype=float)
+    n = min(n, len(scores))
+    if explore <= 0.01 or n <= 0:
+        return [int(i) for i in np.argsort(-scores)[:n]]
+    T = 0.04 + 0.5 * float(explore)
+    z = (scores - scores.max()) / max(T, 1e-3)
+    p = np.exp(z); p = p / p.sum()
+    idx = np.random.default_rng().choice(len(scores), size=n, replace=False, p=p)
+    return [int(i) for i in idx]
+
+
+def _cat_matrix(dicts, vocab):
+    idx = {k: i for i, k in enumerate(vocab)}
+    X = np.zeros((len(dicts), len(vocab)))
+    for i, d in enumerate(dicts):
+        for k in d:
+            if k in idx:
+                X[i, idx[k]] = 1.0
+    nrm = np.linalg.norm(X, axis=1, keepdims=True); nrm[nrm == 0] = 1
+    return X / nrm
+
+
+def similarity_rank(cand, liked, disliked):
+    cat = lambda d: [k for k in d if "=" in k]
+    vocab = sorted({k for grp in (cand, liked, disliked) for d in grp for k in cat(d)})
+    C = _cat_matrix([{k: 1 for k in cat(d)} for d in cand], vocab)
+    L = _cat_matrix([{k: 1 for k in cat(d)} for d in liked], vocab)
+    sim = C @ L.T if len(L) else np.zeros((len(C), 1))
+    score = sim.mean(axis=1) if len(L) else np.zeros(len(C))
+    if disliked:
+        D = _cat_matrix([{k: 1 for k in cat(d)} for d in disliked], vocab)
+        score = score - 0.5 * (C @ D.T).mean(axis=1)
+    nearest = sim.argmax(axis=1) if len(L) else None
+    return score, nearest
+
+
+# --------------------------------------------------------------------------
+# Candidate sourcing
+# --------------------------------------------------------------------------
+def discover_pool(exclude_ids, cap=POOL_CAP):
+    """Fresh, unseen candidates from TMDb discover via tastebuds channels."""
+    if rater is None:
+        return []
+    try:
+        chans = [c for c in rater.load_channels() if c.get("enabled", True)]
+    except Exception:
+        chans = []
+    if not chans:
+        return []
+    pool = {}
+    attempts = 0
+    while len(pool) < cap and attempts < max(8, len(chans) * 3):
+        attempts += 1
+        ch = random.choice(chans)
+        try:
+            cands = rater.fetch_channel(ch)
+        except Exception:
+            continue
+        for m in cands:
+            if m["id"] in exclude_ids or m["id"] in pool:
+                continue
+            pool[m["id"]] = {
+                "id": m["id"], "title": m.get("title", ""), "year": m.get("year", ""),
+                "genres": _split_genres(m.get("genres", "")) if isinstance(m.get("genres"), str) else m.get("genres", []),
+                "link": m.get("link", ""), "poster": m.get("poster", ""),
+                "overview": m.get("overview", ""),
+            }
+    return list(pool.values())[:cap]
+
+
+def candidates_for(source, offline, movies, watchlist, extra_exclude=None):
+    # Exclude only films you've SEEN (rated 1/2/3), plus watchlist and not-interested.
+    # "Not seen" (0) films are intentionally NOT excluded, so they can be
+    # recommended again — even though the rater still won't re-ask you to rate them.
+    # `extra_exclude` carries films already shown this session, so a new batch is
+    # always fresh (the rater passes them via --exclude).
+    extra = set(extra_exclude or [])
+    seen = {m["id"] for m in movies if m["rating"] in (1, 2, 3)}
+    exclude = seen | {m["id"] for m in watchlist} | not_interested_ids() | extra
+    if source == "discover" and not offline:
+        pool = discover_pool(exclude)
+        if pool:
+            return pool, "discover"
+    return [m for m in movies if m["rating"] == 0 and m["id"] not in extra], "shortlist"
+
+
+def load_friends():
+    """All imported friends as a list of {name, likes}. Reads the multi-friend
+    friends.json, falling back to a legacy single-friend friend.json."""
+    if os.path.exists(FRIENDS_PATH):
+        try:
+            with open(FRIENDS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [d for d in data if isinstance(d, dict)]
+        except Exception:
+            return []
+    if os.path.exists(FRIEND_PATH):
+        try:
+            with open(FRIEND_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return [d]
+        except Exception:
+            return []
+    return []
+
+
+def friend_by_name(name):
+    friends = load_friends()
+    if name:
+        for d in friends:
+            if (d.get("name") or "a friend") == name:
+                return d
+    return friends[0] if friends else None
+
+
+def friend_candidates(movies, watchlist, name=None, extra_exclude=None):
+    """Candidates = a chosen friend's liked films you haven't logged yet."""
+    fr = friend_by_name(name)
+    fname = (fr or {}).get("name") or "a friend"
+    label = fname + "'s likes"
+    if not fr or not fr.get("likes"):
+        return [], label
+    exclude = ({m["id"] for m in movies if m["rating"] in (1, 2, 3)}
+               | {m["id"] for m in watchlist} | not_interested_ids() | set(extra_exclude or []))
+    out = []
+    for m in fr["likes"]:
+        mid = m.get("id")
+        if mid is None or mid in exclude:
+            continue
+        g = m.get("genres", [])
+        if isinstance(g, str):
+            g = _split_genres(g)
+        out.append({"id": mid, "title": m.get("title", ""), "year": m.get("year", ""),
+                    "genres": g, "link": m.get("link", ""), "poster": "", "overview": ""})
+    return out[:80], label
+
+
+def build_dataset(movies, watchlist):
+    """Train only on films you've actually seen: Liked (3) = positive,
+    Disliked (1) / Indifferent (2) = negative. The watchlist is NOT used as a
+    training label (those are unseen 'want to watch' titles); it's only used to
+    exclude candidates. This keeps 'liked' meaning seen-and-liked and matches the
+    tally shown in the rater."""
+    train, y, w = [], [], []
+    for m in movies:
+        if m["rating"] == 3:
+            train.append(m); y.append(1); w.append(1.0)
+        elif m["rating"] in (1, 2):
+            train.append(m); y.append(0); w.append(1.0)
+    return train, y, w
+
+
+def _disp_genres(m):
+    g = m.get("genres", [])
+    return ", ".join(g) if isinstance(g, list) else str(g)
+
+
+# --------------------------------------------------------------------------
+# Main pipeline
+# --------------------------------------------------------------------------
+_LANG = {"en": "English", "fr": "French", "es": "Spanish", "ja": "Japanese", "ko": "Korean",
+         "de": "German", "it": "Italian", "zh": "Chinese", "sv": "Swedish", "da": "Danish",
+         "pt": "Portuguese", "ru": "Russian", "hi": "Hindi", "nl": "Dutch", "no": "Norwegian",
+         "fi": "Finnish", "pl": "Polish", "cs": "Czech"}
+
+
+def humanize_feature(tok):
+    if "=" not in tok:
+        return tok
+    k, v = tok.split("=", 1)
+    if k == "dir":
+        return "directed by " + v
+    if k == "lang":
+        return _LANG.get(v, v) + "-language"
+    if k == "decade":
+        return v + "s"
+    return v  # genre / kw / cast read fine as-is
+
+
+def humanize_why(tokens):
+    return ", ".join(humanize_feature(t) for t in tokens)
+
+
+def _atomic_write(path, text):
+    """Write atomically: temp file in the same dir, then os.replace()."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".swap")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+MODEL_VERSION = "v1"   # bump when featurization / model code changes -> invalidates cached models
+
+
+def data_signature(train, y):
+    """Stable hash of the labelled training set (plus a code version), so a cached
+    model is reused only when both your ratings and the pipeline are unchanged."""
+    key = MODEL_VERSION + "|" + ";".join("%d:%d" % (m["id"], l)
+                                         for m, l in sorted(zip(train, y), key=lambda t: t[0]["id"]))
+    return hashlib.md5(key.encode("utf-8")).hexdigest()
+
+
+def load_cached_model(sig):
+    if not os.path.exists(MODEL_PATH):
+        return None
+    try:
+        with open(MODEL_PATH, "r", encoding="utf-8") as f:
+            m = json.load(f)
+    except Exception:
+        return None
+    if m.get("data_sig") == sig and "vocab" in m and "theta" in m:
+        return m
+    return None
+
+
+def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
+        profile="you", exclude_ids=None):
+    # profile is "you" (your taste) or a friend's name. exclude_ids = films already
+    # shown this session, so a fresh Recommend batch never repeats them.
+    exclude_ids = set(exclude_ids or [])
+    is_friend = profile != "you"
+    movies = load_movies(); watchlist = load_watchlist()
+    train, y, w = build_dataset(movies, watchlist)
+    n_pos = int(sum(1 for v in y if v == 1)); n_neg = int(sum(1 for v in y if v == 0))
+
+    candidates, cand_source = ([], "-")
+    if not train_only:
+        if is_friend:
+            candidates, cand_source = friend_candidates(movies, watchlist, profile, exclude_ids)
+        else:
+            candidates, cand_source = candidates_for(source, offline, movies, watchlist, exclude_ids)
+
+    all_ids = sorted({m["id"] for m in train} | {m["id"] for m in candidates})
+    api_key = tf.resolve_api_key()
+    metas = tf.get_features(all_ids, CACHE, api_key=api_key, allow_network=not offline)
+    enriched = sum(1 for i in all_ids if metas.get(i, {}).get("keywords"))
+
+    use_model = n_pos >= MIN_POS_FOR_MODEL and n_neg >= MIN_NEG_FOR_MODEL
+    result = {"mode": "model" if use_model else "similarity", "n_pos": n_pos, "n_neg": n_neg,
+              "candidate_source": cand_source, "candidate_count": len(candidates),
+              "enriched": enriched, "total_ids": len(all_ids),
+              "cv": None, "drivers": [], "recommendations": [], "message": ""}
+
+    if not train and not candidates:
+        result["message"] = "No data yet — rate some films first."
+        return result
+
+    scores = None; why = {}
+    if use_model:
+        sig = data_signature(train, y)
+        cached = None if train_only else load_cached_model(sig)
+        if cached is not None:
+            # reuse the model trained earlier on this exact data — no retrain
+            model = cached
+            result["cv"] = cached.get("cv")
+            vocab = model["vocab"]
+        else:
+            tfe = [featurize(m, metas) for m in train]
+            vec = Vectorizer().fit(tfe)
+            Xtr = vec.transform(tfe); ytr = np.array(y); wtr = np.array(w)
+            k = min(5, n_pos, n_neg)
+            if k >= 2:
+                aucs, aps = [], []
+                for fold in stratified_folds(ytr, k):
+                    te = set(fold.tolist()); tr = np.array([i for i in range(len(ytr)) if i not in te])
+                    if len(np.unique(ytr[tr])) < 2 or len(np.unique(ytr[fold])) < 2:
+                        continue
+                    mdl = train_logreg(Xtr[tr], ytr[tr], wtr[tr])
+                    ps = proba(mdl, Xtr[fold])
+                    aucs.append(roc_auc(ytr[fold], ps)); aps.append(average_precision(ytr[fold], ps))
+                if aucs:
+                    result["cv"] = {"auc": float(np.nanmean(aucs)), "ap": float(np.nanmean(aps)), "k": k}
+            model = train_logreg(Xtr, ytr, wtr)
+            model["vocab"] = vec.vocab; model["cv"] = result["cv"]; model["data_sig"] = sig
+            _atomic_write(MODEL_PATH, json.dumps(model))
+            vocab = vec.vocab
+
+        theta = np.array(model["theta"])[:-1]
+        result["drivers"] = [[nm, round(float(c), 3)] for nm, c in
+                             sorted(zip(vocab, theta), key=lambda t: -abs(t[1]))[:8]]
+        cv_auc = result["cv"]["auc"] if result["cv"] else None
+
+        if candidates:
+            if cv_auc is not None and cv_auc >= 0.58:
+                # model is beating chance -> use it to rank
+                vec2 = Vectorizer(vocab)
+                cfe = [featurize(m, metas) for m in candidates]
+                Xc = vec2.transform(cfe); scores = proba(model, Xc)
+                Xcs = (Xc - np.array(model["mu"])) / np.array(model["sd"])
+                for i, m in enumerate(candidates):
+                    pairs = [(nm, c) for nm, c in zip(vocab, Xcs[i] * theta) if "=" in nm and c > 0]
+                    pairs.sort(key=lambda t: -t[1])
+                    why[m["id"]] = humanize_why([nm for nm, _ in pairs[:3]])
+            else:
+                # model not reliable yet -> rank by similarity to your liked films
+                liked = [mm for mm, l in zip(train, y) if l == 1]
+                disliked = [mm for mm, l in zip(train, y) if l == 0]
+                scores, nearest = similarity_rank([featurize(m, metas) for m in candidates],
+                                                  [featurize(m, metas) for m in liked],
+                                                  [featurize(m, metas) for m in disliked])
+                for i, m in enumerate(candidates):
+                    if nearest is not None:
+                        why[m["id"]] = "similar to films like " + liked[int(nearest[i])]["title"]
+                result["mode"] = "similarity"
+                result["message"] = ("The trained model isn't beating chance yet (too few 'not-liked' "
+                                     "ratings), so these are ranked by similarity to films you liked.")
+    else:
+        liked = [m for m, l in zip(train, y) if l == 1]
+        disliked = [m for m, l in zip(train, y) if l == 0]
+        if train_only:
+            need = []
+            if n_pos < MIN_POS_FOR_MODEL: need.append(f"{MIN_POS_FOR_MODEL - n_pos} more liked")
+            if n_neg < MIN_NEG_FOR_MODEL: need.append(f"{MIN_NEG_FOR_MODEL - n_neg} more not-liked")
+            result["message"] = "Similarity mode (cold start). To train a model, rate " + " and ".join(need) + "."
+            return result
+        if not liked and not is_friend:
+            result["message"] = "Rate at least one Liked (3) film to seed recommendations."
+            return result
+        if candidates:
+            if liked:
+                scores, nearest = similarity_rank([featurize(m, metas) for m in candidates],
+                                                  [featurize(m, metas) for m in liked],
+                                                  [featurize(m, metas) for m in disliked])
+                for i, m in enumerate(candidates):
+                    if nearest is not None:
+                        why[m["id"]] = "similar to: " + liked[int(nearest[i])]["title"]
+            else:
+                # friend mode with no ratings yet — present the friend's picks in order
+                scores = np.arange(len(candidates), 0, -1, dtype=float)
+
+    if is_friend and not train_only:
+        fname = (friend_by_name(profile) or {}).get("name") or "your friend"
+        for m in candidates:
+            why[m["id"]] = "liked by " + fname
+
+    if train_only:
+        if not result["message"]:
+            result["message"] = "Model trained."
+        if use_model and n_neg < 10:
+            result["message"] += (" Note: only %d 'not-liked' ratings, so accuracy is "
+                                  "limited — rate more Indifferent/Disliked films to sharpen it." % n_neg)
+        return result
+
+    if scores is None or not len(candidates):
+        result["message"] = ("No friend picks to show — import a friend's likes, or you've seen them all."
+                             if is_friend else "No candidates to recommend right now.")
+        return result
+
+    order = rank_with_explore(scores, n, explore)
+    sel = [float(scores[int(i)]) for i in order]
+    smin, smax = (min(sel), max(sel)) if sel else (0.0, 1.0)
+    is_model = result["mode"] == "model"
+
+    def to_match(s):
+        if is_model:                       # probability -> percent
+            return int(round(max(0.0, min(1.0, s)) * 100))
+        if smax > smin:                    # similarity -> relative match within this batch
+            return int(round(40 + 55 * (s - smin) / (smax - smin)))
+        return 70
+
+    for i in order:
+        m = candidates[int(i)]
+        meta = metas.get(m["id"], {})
+        sc = float(scores[int(i)])
+        poster = m.get("poster") or ((IMG_BASE + meta["poster_path"]) if meta.get("poster_path") else "")
+        overview = m.get("overview") or meta.get("overview") or ""
+        result["recommendations"].append({
+            "id": m["id"], "title": m["title"], "year": m.get("year", ""),
+            "genres": _disp_genres(m), "link": m.get("link", ""), "poster": poster,
+            "overview": overview, "director": meta.get("director"),
+            "rating": round(float(meta.get("vote_average") or 0), 1),
+            "score": round(sc, 3), "match": to_match(sc), "why": why.get(m["id"], ""),
+        })
+    write_recommendations(result)
+    return result
+
+
+def write_recommendations(result):
+    head = "trained model" if result["mode"] == "model" else "content similarity"
+    lines = ["# Recommendations\n",
+             f"_Generated {date.today().isoformat()} · {head} · source: {result['candidate_source']}_\n",
+             "| # | Title | Year | Score | Why |", "|---|-------|------|-------|-----|"]
+    for i, r in enumerate(result["recommendations"], 1):
+        lines.append(f"| {i} | {r['title'].replace('|','/')} | {r['year']} | {r['score']:.3f} | {r['why'].replace('|','/')} |")
+    _atomic_write(OUT, "\n".join(lines) + "\n")
+
+
+def _print_human(result):
+    print("\n  Movie recommender\n  " + "-" * 17)
+    print(f"  labels: {result['n_pos']} liked / {result['n_neg']} not-liked · "
+          f"mode: {result['mode']} · candidates: {result['candidate_count']} ({result['candidate_source']})")
+    if result["cv"]:
+        print(f"  {result['cv']['k']}-fold CV — ROC-AUC {result['cv']['auc']:.3f} · AP {result['cv']['ap']:.3f}")
+    if result["drivers"]:
+        print("  taste drivers:")
+        for nm, c in result["drivers"]:
+            print(f"    {'+' if c >= 0 else '-'} {nm} ({c:+.2f})")
+    if result["message"]:
+        print("  " + result["message"])
+    for i, r in enumerate(result["recommendations"], 1):
+        print(f"   {i:2d}. {r['title']} ({r['year']})  score {r['score']:.3f}  {r['why']}")
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Personal movie recommender trained on your ratings.")
+    ap.add_argument("--n", type=int, default=15)
+    ap.add_argument("--source", choices=["discover", "shortlist"], default="discover")
+    ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--train-only", action="store_true")
+    ap.add_argument("--explore", type=float, default=0.0)
+    ap.add_argument("--profile", default="you", help='"you" or a friend\'s name')
+    ap.add_argument("--exclude", default="", help="comma-separated ids already shown this session")
+    ap.add_argument("--rebuild-cache", action="store_true", help="delete the metadata cache and refetch")
+    ap.add_argument("--json", action="store_true", help="emit JSON to stdout (for the rater UI)")
+    args = ap.parse_args()
+    if args.rebuild_cache:
+        try:
+            if os.path.exists(CACHE):
+                os.remove(CACHE)
+        except Exception:
+            pass
+    excl = {int(x) for x in args.exclude.split(",") if x.strip().isdigit()}
+    result = run(n=args.n, source=args.source, offline=args.offline,
+                 train_only=args.train_only, explore=args.explore,
+                 profile=args.profile, exclude_ids=excl)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        _print_human(result)
+
+
+if __name__ == "__main__":
+    main()

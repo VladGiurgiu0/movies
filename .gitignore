@@ -1,0 +1,40 @@
+# --- Secrets: never commit your API key ---
+tmdb_key.txt
+.env
+
+# --- Personal data: keep your own ratings/watchlist private ---
+movies.md
+watchlist.md
+not-interested.md
+dismissed.md
+director_cache.json
+channels.json
+friend.json
+friends.json
+providers.json
+
+# The script recreates movies.md / watchlist.md from built-in templates,
+# and channels.json from defaults, if they are missing.
+
+# --- Private notes: design/roadmap docs kept out of the public repo ---
+ideas-for-later/
+
+# --- ML recommender: generated artifacts (regenerable; some derive from your data) ---
+ml-recommender/features_cache.json
+ml-recommender/model.json
+ml-recommender/recommendations.md
+ml-recommender/*.mlpackage
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
