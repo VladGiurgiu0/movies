@@ -1530,7 +1530,7 @@ async function doExport(){
   const note = document.getElementById('export-note');
   let d; try { d = await (await fetch('/api/likes')).json(); } catch(e){ note.textContent = ' Export failed.'; return; }
   const name = document.getElementById('share-name').value.trim();
-  const payload = {app:'movie-rater', name:name, exported:new Date().toISOString().slice(0,10), likes:(d.likes||[])};
+  const payload = {app:'tastebuds', name:name, exported:new Date().toISOString().slice(0,10), likes:(d.likes||[])};
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
   const url = URL.createObjectURL(blob); const a = document.createElement('a');
   a.href = url; a.download = (name ? name.replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'-' : '') + 'likes.json';
@@ -1712,7 +1712,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _host_ok(self):
+        # Accept only loopback Host headers. This closes DNS-rebinding: a remote
+        # page can re-point its own hostname at 127.0.0.1, but its requests still
+        # carry Host: that-hostname, so they're rejected here before anything runs
+        # (including serving the page that embeds the token).
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        return host in ("", "127.0.0.1", "localhost", "::1")
+
     def do_GET(self):
+        if not self._host_ok():
+            self._send(403, json.dumps({"error": "forbidden"}))
+            return
         if self.path == "/" or self.path.startswith("/index"):
             self._send(200, PAGE.replace("__CW_TOKEN__", TOKEN), "text/html; charset=utf-8")
             return
@@ -1751,6 +1762,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _last_shown
+        if not self._host_ok():
+            self._send(403, json.dumps({"error": "forbidden"}))
+            return
         length = int(self.headers.get("Content-Length", 0) or 0)
         raw = self.rfile.read(length) if length else b""
         if self.headers.get("X-Token") != TOKEN:

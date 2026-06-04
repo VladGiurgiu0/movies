@@ -130,6 +130,7 @@ Channels live in `channels.json`, so you can also edit them by hand.
 | `not-interested.md` | **no** (git-ignored) | films you marked *Not interested* |
 | `providers.json` | **no** (git-ignored) | your country + chosen streaming services |
 | `friends.json` | **no** (git-ignored) | imported friends' liked films (one entry per friend) |
+| `director_cache.json` | **no** (git-ignored) | cached director names — auto-created, makes cards load faster |
 | `tmdb_key.txt` | **no** (git-ignored) | your private API key |
 
 The data files are git-ignored so a public repo never leaks your taste log or
@@ -141,9 +142,20 @@ templates whenever they're missing, so a fresh clone just works.
 The [`ml-recommender/`](ml-recommender/) folder has a working recommender that
 learns from your ratings — content-similarity while labels are few, switching to
 a compact logistic-regression model once you've rated enough — and writes a
-ranked `recommendations.md`. It's NumPy-only and exports to Core ML for on-device
-use; see its [README](ml-recommender/README.md) for how it works and why a small
-linear model is the right tool at this scale.
+ranked `recommendations.md`. It's NumPy-only, with a Core ML export for on-device
+use in the works; see its [README](ml-recommender/README.md) for how it works and
+why a small linear model is the right tool at this scale.
+
+## Tests
+
+A small test suite covers the fragile parts (markdown parsing, atomic writes,
+the ranking metrics, and how ratings become training labels). The rater tests
+use only the standard library; the recommender tests need NumPy and skip
+automatically if it isn't installed. From the repo root:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 

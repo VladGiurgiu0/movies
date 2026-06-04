@@ -25,6 +25,9 @@ ml-recommender/model.json
 ml-recommender/recommendations.md
 ml-recommender/*.mlpackage
 
+# Core ML export: work-in-progress, kept private until the Swift app work begins
+ml-recommender/export_coreml.py
+
 # --- Python ---
 __pycache__/
 *.py[cod]

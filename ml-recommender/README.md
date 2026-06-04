@@ -61,11 +61,12 @@ marked Not interested.
   trains in well under a second on a modern laptop with no GPU or special build.
 - **On-device inference (iPhone/Mac)** via Core ML: the trained model is just
   weights + bias + standardization, which maps exactly onto a Core ML linear
-  classifier. `export_coreml.py` (optional, `pip install coremltools`) folds the
-  standardization into the weights and writes `MovieAffinity.mlpackage`, which a
-  Swift app can run entirely on-device. Full on-device *training* is a further
-  step (Core ML updatable models / MLUpdateTask) and is left as future work —
-  retraining on the Mac after each rating session is simpler and plenty fast.
+  classifier — fold the standardization into the weights and a Swift app can run
+  it entirely on-device. A small exporter that writes `MovieAffinity.mlpackage`
+  is **work in progress** and lands with the native-app work. Full on-device
+  *training* is a further step (Core ML updatable models / MLUpdateTask) and is
+  left as future work — retraining on the Mac after each rating session is
+  simpler and plenty fast.
 
 ## Why not TensorFlow / a neural net?
 
@@ -82,8 +83,7 @@ model; the feature pipeline here transfers directly.
 |------|------------|
 | `recommend.py` | the pipeline + CLI (NumPy) |
 | `tmdb_features.py` | TMDb metadata fetch + cache |
-| `export_coreml.py` | optional Core ML export for on-device use |
-| `requirements.txt` | numpy (coremltools optional, for Core ML export) |
+| `requirements.txt` | numpy |
 | `features_cache.json` | cached TMDb metadata (git-ignored) |
 | `model.json` | the trained model (git-ignored) |
 | `recommendations.md` | latest ranked picks (git-ignored) |
