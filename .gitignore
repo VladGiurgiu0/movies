@@ -13,6 +13,7 @@ channels.json
 friend.json
 friends.json
 providers.json
+model_weights.json
 
 # The script recreates movies.md / watchlist.md from built-in templates,
 # and channels.json from defaults, if they are missing.

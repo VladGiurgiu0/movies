@@ -175,18 +175,29 @@ class TestRecommenderMetrics(unittest.TestCase):
 
 @unittest.skipUnless(HAS_NUMPY, "NumPy required for the recommender tests")
 class TestRecommenderLabelling(unittest.TestCase):
-    def test_build_dataset_label_mapping(self):
+    def test_build_dataset_weights_and_not_interested(self):
         movies = [
             {"id": 1, "rating": 3},   # liked -> positive
             {"id": 2, "rating": 2},   # indifferent -> negative
             {"id": 3, "rating": 1},   # disliked -> negative
             {"id": 4, "rating": 0},   # not seen -> excluded
         ]
-        train, y, w = rec.build_dataset(movies, watchlist=[])
-        ids = [m["id"] for m in train]
-        self.assertEqual(ids, [1, 2, 3])          # 0-rated dropped
-        self.assertEqual(y, [1, 0, 0])            # 3 -> 1, {1,2} -> 0
-        self.assertEqual(len(w), 3)
+        ni = [{"id": 5, "rating": None}]   # not interested -> negative when weight > 0
+        w = {"like": 1.0, "indifferent": 0.5, "disliked": 1.0, "not_interested": 0.3}
+        train, y, ww = rec.build_dataset(movies, w, ni)
+        self.assertEqual([m["id"] for m in train], [1, 2, 3, 5])
+        self.assertEqual(y, [1, 0, 0, 0])
+        self.assertEqual(ww, [1.0, 0.5, 1.0, 0.3])     # each carries its reaction's weight
+        # a reaction at weight 0 is dropped entirely
+        w0 = {"like": 1.0, "indifferent": 0.0, "disliked": 1.0, "not_interested": 0.0}
+        train2, _, _ = rec.build_dataset(movies, w0, ni)
+        self.assertEqual([m["id"] for m in train2], [1, 3])   # meh + not-interested dropped
+
+    def test_data_signature_changes_with_weights(self):
+        movies = [{"id": 1, "rating": 3}, {"id": 2, "rating": 1}]
+        a = rec.build_dataset(movies, {"like": 1.0, "indifferent": 0.5, "disliked": 1.0, "not_interested": 0.3}, [])
+        b = rec.build_dataset(movies, {"like": 1.0, "indifferent": 0.5, "disliked": 0.4, "not_interested": 0.3}, [])
+        self.assertNotEqual(rec.data_signature(*a), rec.data_signature(*b))   # weight change -> retrain
 
     def test_humanize_feature(self):
         self.assertEqual(rec.humanize_feature("dir=Greta Gerwig"), "directed by Greta Gerwig")
@@ -367,6 +378,25 @@ class TestWatchlistView(unittest.TestCase):
         self.assertEqual(items[0]["title"], "Newer")
         self.assertIsNone(items[0]["poster"])                  # cache-only, no fetch
         self.assertEqual(items[1]["genres"], "Drama")
+
+
+class TestWeights(unittest.TestCase):
+    def test_save_weights_clamps_and_persists(self):
+        orig = tb.WEIGHTS_PATH
+        tb.WEIGHTS_PATH = os.path.join(tempfile.mkdtemp(), "model_weights.json")
+        try:
+            w = tb.save_weights({"like": 5, "indifferent": -1, "disliked": 1.4,
+                                 "not_interested": 0.3, "bogus": 9})
+            self.assertEqual(w["like"], 2.0)            # clamped to max 2
+            self.assertEqual(w["indifferent"], 0.0)     # clamped to min 0
+            self.assertEqual(w["disliked"], 1.4)        # in range, kept
+            self.assertNotIn("bogus", w)                # unknown key ignored
+            self.assertEqual(tb.load_weights()["disliked"], 1.4)
+        finally:
+            tb.WEIGHTS_PATH = orig
+
+    def test_stats_includes_not_interested_count(self):
+        self.assertIn("notint", tb.stats())
 
 
 if __name__ == "__main__":

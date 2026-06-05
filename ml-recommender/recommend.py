@@ -62,6 +62,11 @@ MODEL_PATH = os.path.join(HERE, "model.json")
 OUT = os.path.join(HERE, "recommendations.md")
 FRIENDS_PATH = os.path.join(ROOT, "friends.json")   # multi-friend list [{name, likes}]
 FRIEND_PATH = os.path.join(ROOT, "friend.json")     # legacy single-friend file
+WEIGHTS_PATH = os.path.join(ROOT, "model_weights.json")   # user's per-reaction training weights
+
+# How strongly each reaction trains the model (strength only; direction is fixed
+# by the reaction: Liked pulls toward, the rest push away). Editable in the UI.
+DEFAULT_WEIGHTS = {"like": 1.0, "indifferent": 0.5, "disliked": 1.0, "not_interested": 0.3}
 IMG_BASE = "https://image.tmdb.org/t/p/w500"
 
 MIN_POS_FOR_MODEL = 8
@@ -124,6 +129,33 @@ def not_interested_ids(path=None):
         if len(c) >= 4 and c[3].isdigit():
             ids.add(int(c[3]))
     return ids
+
+
+def load_not_interested(path=None):
+    """Films marked 'Not interested', as featurizable dicts (used as negatives
+    when the not_interested weight is > 0)."""
+    path = path or (NOT_INTERESTED if os.path.exists(NOT_INTERESTED) else NOT_INTERESTED_LEGACY)
+    items = []
+    for c in _rows(path):   # | Title | Year | Genres | TMDb ID | Link | Marked on |
+        if len(c) >= 4 and c[3].isdigit():
+            items.append({"id": int(c[3]), "rating": None, "title": c[0],
+                          "year": c[1], "genres": _split_genres(c[2])})
+    return items
+
+
+def load_weights():
+    """User's per-reaction training weights, clamped to [0, 2]; defaults if unset."""
+    w = dict(DEFAULT_WEIGHTS)
+    if os.path.exists(WEIGHTS_PATH):
+        try:
+            with open(WEIGHTS_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for k in w:
+                if k in d:
+                    w[k] = max(0.0, min(2.0, float(d[k])))
+        except Exception:
+            pass
+    return w
 
 
 # --------------------------------------------------------------------------
@@ -398,18 +430,27 @@ def friend_candidates(movies, watchlist, name=None, extra_exclude=None):
     return out[:80], label
 
 
-def build_dataset(movies, watchlist):
-    """Train only on films you've actually seen: Liked (3) = positive,
-    Disliked (1) / Indifferent (2) = negative. The watchlist is NOT used as a
-    training label (those are unseen 'want to watch' titles); it's only used to
-    exclude candidates. This keeps 'liked' meaning seen-and-liked and matches the
-    tally shown in the rater."""
+def build_dataset(movies, weights=None, not_interested=None):
+    """Build the labelled training set, each example carrying a per-reaction weight
+    (its 'strength'). Direction is fixed by the reaction:
+      Liked (3) = positive ;  Disliked (1) / Indifferent (2) = negative.
+    'Not interested' films join as negatives when their weight > 0. A reaction with
+    weight 0 is dropped entirely. Watchlist / Not-seen are never training labels.
+    The watchlist is only used elsewhere to exclude candidates."""
+    weights = weights or DEFAULT_WEIGHTS
+    wl = float(weights.get("like", 1.0)); wi = float(weights.get("indifferent", 0.5))
+    wd = float(weights.get("disliked", 1.0)); wn = float(weights.get("not_interested", 0.3))
     train, y, w = [], [], []
     for m in movies:
-        if m["rating"] == 3:
-            train.append(m); y.append(1); w.append(1.0)
-        elif m["rating"] in (1, 2):
-            train.append(m); y.append(0); w.append(1.0)
+        if m["rating"] == 3 and wl > 0:
+            train.append(m); y.append(1); w.append(wl)
+        elif m["rating"] == 2 and wi > 0:
+            train.append(m); y.append(0); w.append(wi)
+        elif m["rating"] == 1 and wd > 0:
+            train.append(m); y.append(0); w.append(wd)
+    if wn > 0 and not_interested:
+        for m in not_interested:
+            train.append(m); y.append(0); w.append(wn)
     return train, y, w
 
 
@@ -463,11 +504,13 @@ def _atomic_write(path, text):
 MODEL_VERSION = "v1"   # bump when featurization / model code changes -> invalidates cached models
 
 
-def data_signature(train, y):
-    """Stable hash of the labelled training set (plus a code version), so a cached
-    model is reused only when both your ratings and the pipeline are unchanged."""
-    key = MODEL_VERSION + "|" + ";".join("%d:%d" % (m["id"], l)
-                                         for m, l in sorted(zip(train, y), key=lambda t: t[0]["id"]))
+def data_signature(train, y, w):
+    """Stable hash of the labelled, weighted training set (plus a code version), so a
+    cached model is reused only when your ratings, the weights, and the pipeline are
+    all unchanged."""
+    key = MODEL_VERSION + "|" + ";".join(
+        "%d:%d:%.3f" % (m["id"], l, ww)
+        for m, l, ww in sorted(zip(train, y, w), key=lambda t: t[0]["id"]))
     return hashlib.md5(key.encode("utf-8")).hexdigest()
 
 
@@ -491,7 +534,9 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
     exclude_ids = set(exclude_ids or [])
     is_friend = profile != "you"
     movies = load_movies(); watchlist = load_watchlist()
-    train, y, w = build_dataset(movies, watchlist)
+    weights = load_weights()
+    ni_items = load_not_interested()
+    train, y, w = build_dataset(movies, weights, ni_items)
     n_pos = int(sum(1 for v in y if v == 1)); n_neg = int(sum(1 for v in y if v == 0))
 
     candidates, cand_source = ([], "-")
@@ -518,7 +563,7 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
 
     scores = None; why = {}
     if use_model:
-        sig = data_signature(train, y)
+        sig = data_signature(train, y, w)
         cached = None if train_only else load_cached_model(sig)
         if cached is not None:
             # reuse the model trained earlier on this exact data — no retrain

@@ -72,6 +72,7 @@ FRIENDS_PATH = os.path.join(SCRIPT_DIR, "friends.json")   # multi-friend list [{
 FRIEND_PATH = os.path.join(SCRIPT_DIR, "friend.json")     # legacy single-friend file (migrated on read)
 PROVIDERS_PATH = os.path.join(SCRIPT_DIR, "providers.json")  # {region, providers:[ids]} streaming filter
 KEY_PATH = os.path.join(SCRIPT_DIR, "tmdb_key.txt")          # where a pasted TMDb key is stored
+WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "model_weights.json")  # per-reaction training weights
 TABLE_END_MARKER = "<!-- TABLE-END -->"
 
 MD_ID_COL = 5          # TMDb ID column index in movies.md rows
@@ -484,6 +485,7 @@ def stats():
         if len(cells) > MD_ID_COL and cells[MD_ID_COL].isdigit() and cells[0] in counts:
             counts[cells[0]] += 1
     counts["watch"] = len(watchlist_ids())
+    counts["notint"] = len(not_interested_ids())
     return counts
 
 
@@ -773,6 +775,38 @@ def save_providers(region, providers):
     ids = ids[:40]
     _atomic_write(PROVIDERS_PATH, json.dumps({"region": region, "providers": ids}, ensure_ascii=False))
     return {"region": region, "providers": ids}
+
+
+# --------------------------------------------------------------------------
+# Model training weights (how strongly each reaction counts)
+# --------------------------------------------------------------------------
+DEFAULT_WEIGHTS = {"like": 1.0, "indifferent": 0.5, "disliked": 1.0, "not_interested": 0.3}
+
+
+def load_weights():
+    w = dict(DEFAULT_WEIGHTS)
+    if os.path.exists(WEIGHTS_PATH):
+        try:
+            with open(WEIGHTS_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for k in w:
+                if k in d:
+                    w[k] = max(0.0, min(2.0, float(d[k])))
+        except Exception:
+            pass
+    return w
+
+
+def save_weights(d):
+    w = load_weights()
+    for k in DEFAULT_WEIGHTS:
+        if isinstance(d, dict) and k in d:
+            try:
+                w[k] = max(0.0, min(2.0, float(d[k])))
+            except (TypeError, ValueError):
+                pass
+    _atomic_write(WEIGHTS_PATH, json.dumps(w, ensure_ascii=False))
+    return w
 
 
 def list_providers(region):
@@ -1320,6 +1354,26 @@ PAGE = r"""<!DOCTYPE html>
   .wl-vb.meh{color:var(--amber)}
   .wl-vb.dis{color:var(--coral)}
   .wl-empty{padding:46px 16px;text-align:center;color:var(--muted);font-size:14px;line-height:1.65}
+
+  /* Model panel: data -> weights -> train -> results */
+  .mstage{font-size:12px;color:var(--muted);margin:14px 0 8px;letter-spacing:-.01em}
+  .mstage-row{display:flex;justify-content:space-between;align-items:baseline}
+  .mreset{background:none;border:none;color:var(--blue);font:inherit;font-size:12px;cursor:pointer;padding:0}
+  .mflow{text-align:center;color:var(--muted);font-size:14px;margin:6px 0;opacity:.55}
+  .mchips{display:flex;gap:8px;flex-wrap:wrap}
+  .mchip{background:var(--gray-tint);border-radius:10px;padding:7px 11px;font-size:12.5px;display:flex;align-items:center;gap:7px;letter-spacing:-.01em}
+  .mchip b{font-weight:600}
+  .wdot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .mnote{font-size:11.5px;color:var(--muted);margin-top:8px;letter-spacing:-.01em}
+  .wgrp{font-size:12px;font-weight:600;margin:12px 0 4px;letter-spacing:-.01em}
+  .wgrp.toward{color:var(--teal)}
+  .wgrp.away{color:var(--coral)}
+  .wrow{display:flex;align-items:center;gap:10px;margin:7px 0}
+  .wrow .wnm{width:96px;flex:0 0 auto;font-size:13px;letter-spacing:-.01em}
+  .wrow input[type=range]{flex:1;accent-color:var(--violet)}
+  .wrow .wv{width:40px;text-align:right;font-size:13px;font-weight:600}
+  .mwarn{font-size:12px;color:var(--coral);margin-top:8px;min-height:14px;letter-spacing:-.01em}
+  .primarybtn:disabled{opacity:.45;cursor:default}
 </style></head>
 <body>
   <div class="page">
@@ -1446,10 +1500,33 @@ PAGE = r"""<!DOCTYPE html>
   <div class="overlay" id="model-overlay">
     <div class="panel" id="model-panel">
       <div class="phead"><h2>Model</h2><button class="x" id="close-model">&times;</button></div>
-      <p class="desc">Train a model from your ratings to sharpen recommendations. You rarely need this — once after rating a batch is plenty, and it's quick after the first run.</p>
-      <div id="train-hint" class="ml-msg"></div>
-      <button class="primarybtn" id="do-train">Train now</button>
-      <div id="train-out"></div>
+      <p class="desc">Tune how strongly each reaction trains your taste model. Your data, your weights, your model.</p>
+
+      <div class="mstage">1 &middot; Your data — what's feeding it</div>
+      <div class="mchips" id="model-data"></div>
+      <div class="mnote">Not seen &amp; watchlist aren't used — they're unwatched.</div>
+
+      <div class="mflow">&#8595;</div>
+
+      <div class="mstage-row"><div class="mstage" style="margin-bottom:0">2 &middot; Weights — how strongly each reaction counts</div><button class="mreset" id="w-reset">Reset</button></div>
+      <div class="wgrp toward">Pulls toward your taste</div>
+      <div class="wrow"><span class="wdot" style="background:var(--teal)"></span><span class="wnm">Liked</span><input type="range" id="w-like" min="0" max="2" step="0.1"><span class="wv" id="wv-like"></span></div>
+      <div class="wgrp away">Pushes away</div>
+      <div class="wrow"><span class="wdot" style="background:var(--amber)"></span><span class="wnm">Indifferent</span><input type="range" id="w-meh" min="0" max="2" step="0.1"><span class="wv" id="wv-meh"></span></div>
+      <div class="wrow"><span class="wdot" style="background:var(--coral)"></span><span class="wnm">Disliked</span><input type="range" id="w-dis" min="0" max="2" step="0.1"><span class="wv" id="wv-dis"></span></div>
+      <div class="wrow"><span class="wdot" style="background:var(--graphite)"></span><span class="wnm">Not interested</span><input type="range" id="w-ni" min="0" max="2" step="0.1"><span class="wv" id="wv-ni"></span></div>
+      <div class="mnote">Strength only — the direction is fixed by the reaction. &times;1.0 = full strength, &times;0 = ignore it.</div>
+      <div class="mwarn" id="w-warn"></div>
+
+      <div class="mflow">&#8595;</div>
+
+      <div class="mstage">3 &middot; Train</div>
+      <button class="primarybtn" id="do-train" style="width:100%">Train model</button>
+
+      <div class="mflow">&#8595;</div>
+
+      <div class="mstage">4 &middot; Results</div>
+      <div id="train-out"><div class="ml-msg">Press <b>Train</b> to see your model's quality and what drives it.</div></div>
     </div>
   </div>
 
@@ -1574,6 +1651,7 @@ const DRV_TIP='The features that most push a film up (toward like) or down, lear
 const SCORE_TIP='How well this film matches your taste. With a trained model it is your estimated chance of liking it; otherwise it is a relative match within this batch.';
 
 function setTally(s){
+  if(s) window._lastStats = s;
   const el = document.getElementById('tally');
   if(s){
     el.innerHTML =
@@ -1581,20 +1659,6 @@ function setTally(s){
       'Disliked <b>'+s['1']+'</b> &middot; Not seen <b>'+s['0']+'</b> &middot; ' +
       '<button class="tally-wl" onclick="openWatchlist()" title="View your watchlist">Watchlist <b>'+s['watch']+'</b></button>';
   } else { el.innerHTML=''; }
-  updateTrainHint(s);
-}
-function updateTrainHint(s){
-  const el = document.getElementById('train-hint'); if(!el || !s) return;
-  const nl = (s['1']||0) + (s['2']||0); const target = 20;
-  if(nl >= target){
-    el.innerHTML = 'You have <b>'+nl+'</b> “not-liked” ratings — enough for the model to learn what you avoid. Train away.';
-    return;
-  }
-  const pct = Math.round(nl/target*100);
-  el.innerHTML = 'The model sharpens as you rate films you didn’t love. You have <b>'+nl+'</b> '+
-    'Indifferent/Disliked — about <b>'+(target-nl)+'</b> more unlocks a reliable model.'+
-    '<div style="height:6px;border-radius:4px;background:var(--gray-tint);margin-top:8px;overflow:hidden">'+
-    '<div style="height:100%;width:'+pct+'%;background:var(--teal)"></div></div>';
 }
 
 function render(d){
@@ -1870,26 +1934,72 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Escape'){ if(settingsOpen) closeSettings(); if(editOpen) closeEdit(); if(modelOpen) closeModel(); if(exportOpen) closeExport(); if(friendsOpen) closeFriends(); if(providersOpen) closeProviders(); if(watchlistOpen) closeWatchlist(); }
 });
 
-/* ---- Model (train) panel ---- */
-function openModel(){ document.getElementById('model-overlay').classList.add('open'); modelOpen = true; }
+/* ---- Model panel (data -> weights -> train -> results) ---- */
+const W_DEFAULTS = {like:1.0, indifferent:0.5, disliked:1.0, not_interested:0.3};
+const W_IDS = {like:'w-like', indifferent:'w-meh', disliked:'w-dis', not_interested:'w-ni'};
+let modelWeights = Object.assign({}, W_DEFAULTS);
+let lastAuc = null;   // remembered this session for the before/after delta
+
+function renderWeightSliders(){
+  for(const k in W_IDS){
+    const s=document.getElementById(W_IDS[k]); s.value = modelWeights[k];
+    document.getElementById('wv-'+W_IDS[k].slice(2)).textContent = '×'+Number(modelWeights[k]).toFixed(1);
+  }
+  checkLikeGuard();
+}
+function checkLikeGuard(){
+  const warn=document.getElementById('w-warn'), t=document.getElementById('do-train');
+  if(parseFloat(document.getElementById('w-like').value) <= 0){
+    warn.textContent='Liked can’t be 0 — the model needs something to aim toward.'; t.disabled=true;
+  } else { warn.textContent=''; t.disabled=false; }
+}
+function renderModelData(s){
+  const box=document.getElementById('model-data'); if(!box) return;
+  if(!s){ box.innerHTML='<span class="mnote">Rate a few films to start.</span>'; return; }
+  box.innerHTML =
+    '<div class="mchip"><span class="wdot" style="background:var(--teal)"></span>Liked <b>'+(s['3']||0)+'</b></div>'+
+    '<div class="mchip"><span class="wdot" style="background:var(--amber)"></span>Indifferent <b>'+(s['2']||0)+'</b></div>'+
+    '<div class="mchip"><span class="wdot" style="background:var(--coral)"></span>Disliked <b>'+(s['1']||0)+'</b></div>'+
+    '<div class="mchip"><span class="wdot" style="background:var(--graphite)"></span>Not interested <b>'+(s['notint']||0)+'</b></div>';
+}
+async function openModel(){
+  document.getElementById('model-overlay').classList.add('open'); modelOpen = true;
+  renderModelData(window._lastStats);
+  try{ const d=await (await fetch('/api/weights')).json(); if(d.weights) modelWeights=Object.assign({}, W_DEFAULTS, d.weights); }catch(e){}
+  renderWeightSliders();
+}
 function closeModel(){ document.getElementById('model-overlay').classList.remove('open'); modelOpen = false; }
 document.getElementById('open-model').onclick = openModel;
 document.getElementById('close-model').onclick = closeModel;
 document.getElementById('model-overlay').onclick = e=>{ if(e.target.id==='model-overlay') closeModel(); };
+for(const k in W_IDS){
+  const s=document.getElementById(W_IDS[k]);
+  s.oninput = ()=>{ modelWeights[k]=parseFloat(s.value);
+    document.getElementById('wv-'+W_IDS[k].slice(2)).textContent='×'+Number(s.value).toFixed(1);
+    if(k==='like') checkLikeGuard(); };
+}
+document.getElementById('w-reset').onclick = ()=>{ modelWeights=Object.assign({}, W_DEFAULTS); renderWeightSliders(); };
 document.getElementById('do-train').onclick = ()=> runTrain('/api/train');
 async function runTrain(url){
   const out = document.getElementById('train-out');
-  out.innerHTML = '<div class="ml-msg">Working… the first run fetches TMDb metadata for your films, which can take up to a minute.</div>';
+  out.innerHTML = '<div class="ml-msg">Saving your weights and training… the first run can fetch some TMDb metadata.</div>';
+  try{ await fetch('/api/weights',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weights:modelWeights})}); }catch(e){}
   let d; try { d = await (await fetch(url,{method:'POST'})).json(); }
   catch(e){ out.innerHTML = '<div class="ml-msg">Request failed.</div>'; return; }
   if(!d.ok){ out.innerHTML = '<div class="ml-msg">'+esc(d.error||'Failed.')+'</div>'; return; }
   const r = d.data; let h='';
-  h += '<div class="stat">Mode: <b>'+esc(r.mode)+'</b>'+tip(MODE_TIP)+' &middot; '+r.n_pos+' liked / '+r.n_neg+' not-liked</div>';
-  if(r.cv){ h += '<div class="stat">'+r.cv.k+'-fold CV — ROC-AUC <b>'+r.cv.auc.toFixed(3)+'</b>'+tip(AUC_TIP)+' &middot; AP <b>'+r.cv.ap.toFixed(3)+'</b>'+tip(AP_TIP)+'</div>'; }
+  h += '<div class="stat">Mode: <b>'+esc(r.mode)+'</b>'+tip(MODE_TIP)+' &middot; '+r.n_pos+' toward / '+r.n_neg+' away</div>';
+  if(r.cv){
+    const auc=r.cv.auc; let delta='';
+    if(lastAuc!=null){ const dl=auc-lastAuc; const up=dl>=0;
+      delta=' <span style="font-size:12px;color:'+(up?'var(--teal)':'var(--coral)')+'">'+(up?'▲ +':'▼ −')+Math.abs(dl).toFixed(3)+' vs last ('+lastAuc.toFixed(3)+')</span>'; }
+    h += '<div class="stat">'+r.cv.k+'-fold CV — ROC-AUC <b>'+auc.toFixed(3)+'</b>'+delta+tip(AUC_TIP)+' &middot; AP <b>'+r.cv.ap.toFixed(3)+'</b>'+tip(AP_TIP)+'</div>';
+    lastAuc=auc;
+  }
   if(r.message){ h += '<div class="ml-msg">'+esc(r.message)+'</div>'; }
   if(r.drivers && r.drivers.length){
     const mx = Math.max.apply(null, r.drivers.map(x=>Math.abs(x[1]))) || 1;
-    h += '<div class="stat" style="margin-top:12px">Taste drivers'+tip(DRV_TIP)+' <span class="rs">(green = toward like, coral = away)</span></div>';
+    h += '<div class="stat" style="margin-top:12px">Taste drivers'+tip(DRV_TIP)+' <span class="rs">(green = toward, coral = away)</span></div>';
     r.drivers.forEach(x=>{ const w = Math.round(Math.abs(x[1])/mx*150);
       h += '<div class="drv"><div class="nm">'+esc(x[0])+'</div><div class="bar'+(x[1]<0?' neg':'')+'" style="width:'+w+'px"></div></div>'; });
   }
@@ -2433,6 +2543,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"results": search_keywords(q)}))
         elif self.path.startswith("/api/state"):
             self._send(200, json.dumps({"needs_onboarding": needs_onboarding(), "has_key": bool(API_KEY)}))
+        elif self.path.startswith("/api/weights"):
+            self._send(200, json.dumps({"weights": load_weights()}))
         elif self.path.startswith("/api/watchlist"):
             self._send(200, json.dumps({"items": get_watchlist()}))
         elif self.path.startswith("/api/poster"):
@@ -2545,6 +2657,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"error": str(e)}))
                 return
             self._send(200, json.dumps({"ok": True, "stats": stats()}))
+
+        elif self.path.startswith("/api/weights"):
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+                w = save_weights(body.get("weights", {}))
+            except Exception as e:
+                self._send(400, json.dumps({"error": str(e)}))
+                return
+            self._send(200, json.dumps({"ok": True, "weights": w}))
 
         elif self.path.startswith("/api/rebuild-cache"):
             ok, data = run_recommender(["--train-only", "--rebuild-cache"])

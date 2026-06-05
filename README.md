@@ -152,6 +152,7 @@ pools just need to point in roughly the right direction. Channels live in
 | `friends.json` | **no** (git-ignored) | imported friends' liked films (one entry per friend) |
 | `director_cache.json` | **no** (git-ignored) | cached director names — auto-created, makes cards load faster |
 | `poster_cache.json` | **no** (git-ignored) | cached poster paths for the watchlist view — auto-created |
+| `model_weights.json` | **no** (git-ignored) | how strongly each reaction trains your model — set in the Model panel |
 | `tmdb_key.txt` | **no** (git-ignored) | your private API key |
 
 The data files are git-ignored so a public repo never leaks your taste log or
