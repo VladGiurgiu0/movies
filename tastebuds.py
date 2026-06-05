@@ -67,6 +67,7 @@ CHANNELS_PATH = os.path.join(SCRIPT_DIR, "channels.json")
 ML_DIR = os.path.join(SCRIPT_DIR, "ml-recommender")
 RECOMMEND_PY = os.path.join(ML_DIR, "recommend.py")
 DIRECTOR_CACHE_PATH = os.path.join(SCRIPT_DIR, "director_cache.json")
+POSTER_CACHE_PATH = os.path.join(SCRIPT_DIR, "poster_cache.json")   # cached poster paths (watchlist view)
 FRIENDS_PATH = os.path.join(SCRIPT_DIR, "friends.json")   # multi-friend list [{name, likes}]
 FRIEND_PATH = os.path.join(SCRIPT_DIR, "friend.json")     # legacy single-friend file (migrated on read)
 PROVIDERS_PATH = os.path.join(SCRIPT_DIR, "providers.json")  # {region, providers:[ids]} streaming filter
@@ -882,6 +883,69 @@ def fetch_director(movie_id):
     return director
 
 
+def _director_cached(movie_id):
+    """Director from the cache only (no network) — for fast list rendering."""
+    return _directors().get(str(movie_id))
+
+
+# --------------------------------------------------------------------------
+# Poster lookup (cached; used by the watchlist view)
+# --------------------------------------------------------------------------
+_poster_cache = None
+def _posters():
+    global _poster_cache
+    if _poster_cache is None:
+        _poster_cache = {}
+        if os.path.exists(POSTER_CACHE_PATH):
+            try:
+                with open(POSTER_CACHE_PATH, "r", encoding="utf-8") as f:
+                    _poster_cache = json.load(f)
+            except Exception:
+                _poster_cache = {}
+    return _poster_cache
+
+
+def _poster_cached(movie_id):
+    """Poster URL from the cache only (no network); None if not cached or none exists."""
+    p = _posters().get(str(movie_id))
+    return (IMG_BASE + p) if p else None
+
+
+def fetch_poster(movie_id):
+    """Poster URL, cache-first then one TMDb fetch (cached so it never re-hits)."""
+    cache = _posters(); key = str(movie_id)
+    if key in cache:
+        return (IMG_BASE + cache[key]) if cache[key] else None
+    path = None
+    if API_KEY:
+        try:
+            data = tmdb_get(f"movie/{movie_id}", {})
+            path = data.get("poster_path")
+        except Exception:
+            path = None
+    cache[key] = path
+    try:
+        _atomic_write(POSTER_CACHE_PATH, json.dumps(cache))
+    except Exception:
+        pass
+    return (IMG_BASE + path) if path else None
+
+
+def get_watchlist():
+    """Saved films, newest first, enriched from caches only (posters fill in lazily
+    via /api/poster so the sheet opens instantly)."""
+    items = []
+    for line in _table_lines(WATCHLIST_PATH):   # | Title | Year | Genres | TMDb ID | Link | Added on |
+        c = [x.strip() for x in line.strip().strip("|").split("|")]
+        if len(c) > WATCH_ID_COL and c[WATCH_ID_COL].isdigit():
+            mid = int(c[WATCH_ID_COL])
+            items.append({"id": mid, "title": c[0], "year": c[1], "genres": c[2],
+                          "link": c[4] if len(c) > 4 else f"https://www.themoviedb.org/movie/{mid}",
+                          "poster": _poster_cached(mid), "director": _director_cached(mid)})
+    items.reverse()   # most recently added on top
+    return items
+
+
 # --------------------------------------------------------------------------
 # ML recommender bridge (runs ml-recommender/recommend.py as a subprocess so
 # the rater itself stays dependency-free)
@@ -1221,6 +1285,41 @@ PAGE = r"""<!DOCTYPE html>
   .onb-verd b{font-weight:600}
   .onb-skip{background:none;border:none;color:var(--muted);font:inherit;font-size:12.5px;cursor:pointer;text-decoration:underline;padding:0;letter-spacing:-.01em}
   .pbtn:disabled{opacity:.45;cursor:default}
+
+  /* Watchlist bottom sheet */
+  .tally-wl{background:none;border:none;font:inherit;font-size:12.5px;color:var(--muted);cursor:pointer;padding:0;letter-spacing:-.01em}
+  .tally-wl b{color:var(--txt);font-weight:600}
+  .tally-wl:hover{color:var(--txt);text-decoration:underline}
+  #wl-overlay{align-items:flex-end;justify-content:center;padding:0}
+  .wl-sheet{width:100%;max-width:860px;background:var(--card);border:1px solid var(--line);border-bottom:none;
+            border-radius:22px 22px 0 0;box-shadow:var(--shadow);max-height:86vh;display:flex;flex-direction:column;
+            transform:translateY(100%);transition:transform .42s cubic-bezier(.4,0,.2,1)}
+  .wl-sheet.up{transform:translateY(0)}
+  .wl-grip{width:38px;height:5px;border-radius:999px;background:var(--line);margin:10px auto 4px;cursor:pointer;flex:0 0 auto}
+  .wl-head{display:flex;align-items:center;justify-content:space-between;padding:4px 22px 12px;flex:0 0 auto}
+  .wl-head h2{font-size:19px;font-weight:600;letter-spacing:-.02em;margin:0;display:flex;align-items:center;gap:10px}
+  .wl-cnt{font-size:12px;color:var(--muted);background:var(--gray-tint);padding:2px 9px;border-radius:980px;font-weight:500}
+  .wl-list{overflow-y:auto;padding:2px 18px 22px}
+  .wl-item{display:flex;gap:13px;padding:13px 2px;border-bottom:1px solid var(--line)}
+  .wl-thumb{width:48px;height:72px;border-radius:9px;background:var(--gray-tint);flex:0 0 auto;object-fit:cover;
+            display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .wl-thumb svg{width:18px;height:18px}
+  .wl-info{flex:1;min-width:0}
+  .wl-row1{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+  .wl-t{font-size:15px;font-weight:600;letter-spacing:-.01em;min-width:0}
+  .wl-t .yr{color:var(--muted);font-weight:400}
+  .wl-ic{display:flex;gap:2px;flex:0 0 auto}
+  .wl-ic button,.wl-ic a{background:none;border:none;color:var(--muted);cursor:pointer;padding:5px;border-radius:8px;display:inline-flex;text-decoration:none}
+  .wl-ic button:hover,.wl-ic a:hover{color:var(--txt);background:var(--gray-tint)}
+  .wl-ic svg{width:16px;height:16px}
+  .wl-g{font-size:12.5px;color:var(--muted);margin:2px 0 9px;letter-spacing:-.01em}
+  .wl-watch{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .wl-watch .lbl{font-size:11.5px;color:var(--muted)}
+  .wl-vb{background:transparent;font-size:12px;padding:4px 11px;border-radius:980px;cursor:pointer;border:1px solid currentColor;line-height:1;font-family:inherit}
+  .wl-vb.like{color:var(--teal)}
+  .wl-vb.meh{color:var(--amber)}
+  .wl-vb.dis{color:var(--coral)}
+  .wl-empty{padding:46px 16px;text-align:center;color:var(--muted);font-size:14px;line-height:1.65}
 </style></head>
 <body>
   <div class="page">
@@ -1439,6 +1538,17 @@ PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="overlay" id="wl-overlay">
+    <div class="wl-sheet" id="wl-sheet">
+      <div class="wl-grip" id="wl-grip"></div>
+      <div class="wl-head">
+        <h2>Watchlist <span class="wl-cnt" id="wl-cnt"></span></h2>
+        <button class="x" id="wl-close">&times;</button>
+      </div>
+      <div class="wl-list" id="wl-list"></div>
+    </div>
+  </div>
+
 <script>
 const TOKEN='__CW_TOKEN__';
 const _origFetch = window.fetch.bind(window);
@@ -1469,7 +1579,7 @@ function setTally(s){
     el.innerHTML =
       'Liked <b>'+s['3']+'</b> &middot; Indifferent <b>'+s['2']+'</b> &middot; ' +
       'Disliked <b>'+s['1']+'</b> &middot; Not seen <b>'+s['0']+'</b> &middot; ' +
-      'Watchlist <b>'+s['watch']+'</b>';
+      '<button class="tally-wl" onclick="openWatchlist()" title="View your watchlist">Watchlist <b>'+s['watch']+'</b></button>';
   } else { el.innerHTML=''; }
   updateTrainHint(s);
 }
@@ -1757,7 +1867,7 @@ document.querySelectorAll('#k-match button').forEach(b=>b.onclick=()=>{ kMatch=b
 document.getElementById('undo').onclick = undo;
 
 document.addEventListener('keydown', e=>{
-  if(e.key==='Escape'){ if(settingsOpen) closeSettings(); if(editOpen) closeEdit(); if(modelOpen) closeModel(); if(exportOpen) closeExport(); if(friendsOpen) closeFriends(); if(providersOpen) closeProviders(); }
+  if(e.key==='Escape'){ if(settingsOpen) closeSettings(); if(editOpen) closeEdit(); if(modelOpen) closeModel(); if(exportOpen) closeExport(); if(friendsOpen) closeFriends(); if(providersOpen) closeProviders(); if(watchlistOpen) closeWatchlist(); }
 });
 
 /* ---- Model (train) panel ---- */
@@ -2104,6 +2214,77 @@ if(window.ResizeObserver){
 window.addEventListener('resize', sizeFlip);
 setTimeout(sizeFlip, 60);
 
+/* ---- Watchlist bottom sheet ---- */
+let watchlistOpen=false, wlPosterObserver=null;
+const WL_FILM='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M8.5 4v16"/></svg>';
+const WL_LINK='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
+
+async function openWatchlist(){
+  const overlay=document.getElementById('wl-overlay'), sheet=document.getElementById('wl-sheet'), list=document.getElementById('wl-list');
+  list.innerHTML='<div class="wl-empty">Loading…</div>';
+  overlay.classList.add('open'); watchlistOpen=true;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>sheet.classList.add('up')));
+  let items=[]; try{ items=(await (await fetch('/api/watchlist')).json()).items||[]; }catch(e){}
+  renderWatchlist(items);
+}
+function closeWatchlist(){
+  const overlay=document.getElementById('wl-overlay'), sheet=document.getElementById('wl-sheet');
+  sheet.classList.remove('up'); watchlistOpen=false;
+  setTimeout(()=>overlay.classList.remove('open'), 420);
+}
+function wlCount(n){ document.getElementById('wl-cnt').textContent = n+(n===1?' film':' films'); }
+function renderWatchlist(items){
+  const list=document.getElementById('wl-list');
+  wlCount(items.length);
+  if(!items.length){ list.innerHTML='<div class="wl-empty">Nothing saved yet.<br>Tap <b>Add to Watchlist</b> on a film to keep it here.</div>'; return; }
+  list.innerHTML=items.map(m=>{
+    const genres=(m.genres||'').split(',').map(g=>g.trim()).filter(Boolean).map(esc).join(' · ');
+    const dir=m.director?esc(m.director):'';
+    const meta=[genres,dir].filter(Boolean).join(' · ');
+    const thumb=m.poster ? '<img class="wl-thumb" src="'+escAttr(m.poster)+'" alt="">'
+                         : '<div class="wl-thumb" data-pid="'+m.id+'">'+WL_FILM+'</div>';
+    return '<div class="wl-item" data-id="'+m.id+'">'+thumb+
+      '<div class="wl-info">'+
+        '<div class="wl-row1"><div class="wl-t">'+esc(m.title)+' <span class="yr">('+esc(String(m.year||''))+')</span></div>'+
+          '<div class="wl-ic"><button class="wl-rm" aria-label="Remove from watchlist">'+TRASH_SVG+'</button>'+
+            '<a href="'+escAttr(m.link)+'" target="_blank" rel="noopener" aria-label="Open on TMDb">'+WL_LINK+'</a></div></div>'+
+        (meta?('<div class="wl-g">'+meta+'</div>'):'<div class="wl-g"></div>')+
+        '<div class="wl-watch"><span class="lbl">Mark watched</span>'+
+          '<button class="wl-vb like" data-r="3">Liked</button>'+
+          '<button class="wl-vb meh" data-r="2">Indifferent</button>'+
+          '<button class="wl-vb dis" data-r="1">Disliked</button></div>'+
+      '</div></div>';
+  }).join('');
+  list.querySelectorAll('.wl-item').forEach(it=>{
+    const id=+it.dataset.id, m=items.find(x=>x.id===id);
+    it.querySelectorAll('.wl-vb').forEach(b=>b.onclick=()=>wlAct(it,'/api/setstatus',
+      {movie:{id:m.id,title:m.title,year:m.year,genres:m.genres,link:m.link}, status:b.dataset.r}));
+    it.querySelector('.wl-rm').onclick=()=>wlAct(it,'/api/wl-remove',{id:m.id});
+  });
+  lazyPosters();
+}
+async function wlAct(it, url, body){
+  try{ const d=await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json(); if(d.stats) setTally(d.stats); }catch(e){}
+  it.style.transition='opacity .2s'; it.style.opacity='0';
+  setTimeout(()=>{ it.remove(); const n=document.querySelectorAll('#wl-list .wl-item').length; if(!n) renderWatchlist([]); else wlCount(n); }, 200);
+}
+function lazyPosters(){
+  const ph=document.querySelectorAll('#wl-list .wl-thumb[data-pid]'); if(!ph.length) return;
+  if(wlPosterObserver) wlPosterObserver.disconnect();
+  wlPosterObserver=new IntersectionObserver((ents,obs)=>{
+    ents.forEach(async e=>{
+      if(!e.isIntersecting) return;
+      const el=e.target, pid=el.dataset.pid; obs.unobserve(el); el.removeAttribute('data-pid');
+      try{ const d=await (await fetch('/api/poster?id='+pid)).json();
+        if(d.poster){ const img=new Image(); img.className='wl-thumb'; img.alt=''; img.src=d.poster; el.replaceWith(img); } }catch(e){}
+    });
+  }, {root:document.getElementById('wl-list'), rootMargin:'250px'});
+  ph.forEach(el=>wlPosterObserver.observe(el));
+}
+document.getElementById('wl-close').onclick = closeWatchlist;
+document.getElementById('wl-grip').onclick = closeWatchlist;
+document.getElementById('wl-overlay').onclick = e=>{ if(e.target.id==='wl-overlay') closeWatchlist(); };
+
 /* ---- First-run onboarding ---- */
 let onbSeed=null, onbSteps=[], onbIdx=0, onboardingActive=false, onbSearchTimer=null;
 function onbShow(){
@@ -2252,6 +2433,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"results": search_keywords(q)}))
         elif self.path.startswith("/api/state"):
             self._send(200, json.dumps({"needs_onboarding": needs_onboarding(), "has_key": bool(API_KEY)}))
+        elif self.path.startswith("/api/watchlist"):
+            self._send(200, json.dumps({"items": get_watchlist()}))
+        elif self.path.startswith("/api/poster"):
+            from urllib.parse import urlparse, parse_qs
+            pid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            self._send(200, json.dumps({"poster": fetch_poster(int(pid)) if pid.isdigit() else None}))
         elif self.path.startswith("/api/likes"):
             self._send(200, json.dumps({"likes": liked_export()}))
         elif self.path.startswith("/api/friends"):
@@ -2347,6 +2534,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"ok": False, "error": str(e)}))
                 return
             self._send(200, json.dumps({"ok": True} if ok else {"ok": False, "error": msg}))
+
+        elif self.path.startswith("/api/wl-remove"):
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+                mid = int(body["id"])
+                with _io_lock:
+                    remove_row_by_id(WATCHLIST_PATH, WATCH_ID_COL, mid)
+            except Exception as e:
+                self._send(400, json.dumps({"error": str(e)}))
+                return
+            self._send(200, json.dumps({"ok": True, "stats": stats()}))
 
         elif self.path.startswith("/api/rebuild-cache"):
             ok, data = run_recommender(["--train-only", "--rebuild-cache"])

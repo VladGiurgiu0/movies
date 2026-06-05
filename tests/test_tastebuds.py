@@ -338,5 +338,36 @@ class TestOnboarding(unittest.TestCase):
             (tb.load_channels, tb.rated_ids, tb.watchlist_ids) = orig
 
 
+class TestWatchlistView(unittest.TestCase):
+    WL_MD = (
+        "# Watchlist\n\n<!-- TABLE-START -->\n\n"
+        "| Title | Year | Genres | TMDb ID | Link | Added on |\n"
+        "|-------|------|--------|---------|------|----------|\n"
+        "| Older | 2001 | Drama | 11 | http://x/11 | 2026-01-01 |\n"
+        "| Newer | 2002 | Comedy | 22 | http://x/22 | 2026-01-02 |\n\n"
+        "<!-- TABLE-END -->\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.wl = os.path.join(self.tmp, "watchlist.md")
+        with open(self.wl, "w", encoding="utf-8") as f:
+            f.write(self.WL_MD)
+        self._orig = (tb.WATCHLIST_PATH, tb._poster_cache, tb._director_cache)
+        tb.WATCHLIST_PATH = self.wl
+        tb._poster_cache = {}      # nothing cached -> posters come back None
+        tb._director_cache = {}
+
+    def tearDown(self):
+        (tb.WATCHLIST_PATH, tb._poster_cache, tb._director_cache) = self._orig
+
+    def test_parses_newest_first_no_network(self):
+        items = tb.get_watchlist()
+        self.assertEqual([m["id"] for m in items], [22, 11])   # reversed = newest on top
+        self.assertEqual(items[0]["title"], "Newer")
+        self.assertIsNone(items[0]["poster"])                  # cache-only, no fetch
+        self.assertEqual(items[1]["genres"], "Drama")
+
+
 if __name__ == "__main__":
     unittest.main()

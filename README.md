@@ -30,6 +30,9 @@ dependency (NumPy).
 - **Four verdicts** on an ordinal scale plus a separate watchlist:
   - `3` Liked · `2` Indifferent · `1` Disliked · `0` Not seen
   - **Add to Watchlist** for "want to watch later"
+- **Your watchlist, one tap away** — click the **Watchlist** count to slide up a
+  sheet of everything you've saved, each with its poster; mark one **watched**
+  (it moves into your ratings), remove it, or open it on TMDb.
 - **Channels** — the pools your movies come from, built four ways: by **genre**,
   **"more like a movie"** you love (TMDb's neighbours of a seed film), **films by
   a person** (a director or actor), or a **keyword** (a real TMDb tag, picked from
@@ -148,6 +151,7 @@ pools just need to point in roughly the right direction. Channels live in
 | `providers.json` | **no** (git-ignored) | your country + chosen streaming services |
 | `friends.json` | **no** (git-ignored) | imported friends' liked films (one entry per friend) |
 | `director_cache.json` | **no** (git-ignored) | cached director names — auto-created, makes cards load faster |
+| `poster_cache.json` | **no** (git-ignored) | cached poster paths for the watchlist view — auto-created |
 | `tmdb_key.txt` | **no** (git-ignored) | your private API key |
 
 The data files are git-ignored so a public repo never leaks your taste log or
