@@ -399,5 +399,175 @@ class TestWeights(unittest.TestCase):
         self.assertIn("notint", tb.stats())
 
 
+WATCHLIST_SAMPLE_MD = (
+    "# Watchlist\n\n<!-- TABLE-START -->\n\n"
+    "| Title | Year | Genres | TMDb ID | Link | Added on |\n"
+    "|-------|------|--------|---------|------|----------|\n"
+    "| Wish One | 2019 | Drama | 777 | http://x/777 | 2026-01-02 |\n\n"
+    "<!-- TABLE-END -->\n"
+)
+
+
+class TestShareExport(unittest.TestCase):
+    """The share file: full versioned payload, model attached only when valid."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+        def w(name, text):
+            p = os.path.join(self.tmp, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            return p
+
+        self._orig = (tb.MD_PATH, tb.WATCHLIST_PATH, tb.NOT_INTERESTED_PATH, tb.ML_DIR)
+        tb.MD_PATH = w("movies.md", MOVIES_MD)
+        tb.WATCHLIST_PATH = w("watchlist.md", WATCHLIST_SAMPLE_MD)
+        tb.NOT_INTERESTED_PATH = w("not-interested.md", NOT_INTERESTED_OLD_MD)
+        tb.ML_DIR = self.tmp          # model.json (if any) lives here during the test
+
+    def tearDown(self):
+        (tb.MD_PATH, tb.WATCHLIST_PATH, tb.NOT_INTERESTED_PATH, tb.ML_DIR) = self._orig
+
+    def test_payload_shape_and_seen_ids(self):
+        s = tb.share_export()
+        self.assertEqual(s["app"], "tastebuds")
+        self.assertEqual(s["version"], tb.SHARE_VERSION)
+        self.assertEqual([m["id"] for m in s["likes"]], [111])
+        self.assertEqual([m["id"] for m in s["dislikes"]], [222])
+        self.assertEqual([m["id"] for m in s["watchlist"]], [777])
+        self.assertEqual(s["seen"], [111, 222, 333])   # rated 1/2/3; the 0-shortlist is unseen
+        self.assertNotIn("model", s)                   # no model.json -> nothing attached
+
+    def test_model_attached_only_when_well_formed(self):
+        good = {"vocab": ["genre=Drama"], "theta": [0.5, 0.1], "mu": [0.2], "sd": [1.0],
+                "cv": {"auc": 0.7}, "version": "v1"}
+        mp = os.path.join(self.tmp, "model.json")
+        with open(mp, "w", encoding="utf-8") as f:
+            json.dump(good, f)
+        s = tb.share_export()
+        self.assertEqual(s["model"]["schema"], "v1")
+        self.assertEqual(s["model"]["vocab"], ["genre=Drama"])
+        with open(mp, "w", encoding="utf-8") as f:
+            json.dump(dict(good, theta=[0.5]), f)      # theta must be len(vocab)+1
+        self.assertNotIn("model", tb.share_export())
+
+
+class TestCleanFriend(unittest.TestCase):
+    """Importing a friend keeps the new fields, survives old files, rejects junk."""
+
+    def test_full_record_round_trips(self):
+        data = {"name": "Anna",
+                "likes": [{"id": 1, "title": "A", "year": 2000, "genres": "Drama", "link": ""}],
+                "dislikes": [{"id": 2, "title": "B", "year": "2001", "genres": "", "link": ""}],
+                "watchlist": [{"id": 3, "title": "C", "year": "2002", "genres": "", "link": ""}],
+                "seen": [2, "7", "junk", -1],
+                "model": {"schema": "v1", "vocab": ["a", "b"], "theta": [1, 2, 3],
+                          "mu": [0, 0], "sd": [1, 1], "cv": {"auc": 0.66}}}
+        fr = tb._clean_friend(data)
+        self.assertEqual(fr["name"], "Anna")
+        self.assertEqual([m["id"] for m in fr["likes"]], [1])
+        self.assertEqual([m["id"] for m in fr["dislikes"]], [2])
+        self.assertEqual([m["id"] for m in fr["watchlist"]], [3])
+        self.assertEqual(fr["seen"], [2, 7])           # ints kept; junk and negatives dropped
+        self.assertEqual(fr["model"]["theta"], [1.0, 2.0, 3.0])
+
+    def test_legacy_likes_only_file_still_imports(self):
+        fr = tb._clean_friend({"name": "Old", "likes": [{"id": 9, "title": "X"}]})
+        self.assertEqual([m["id"] for m in fr["likes"]], [9])
+        self.assertEqual(fr["dislikes"], [])
+        self.assertEqual(fr["watchlist"], [])
+        self.assertEqual(fr["seen"], [])
+        self.assertNotIn("model", fr)
+
+    def test_malformed_model_is_dropped(self):
+        base = {"name": "Bad", "likes": [],
+                "model": {"schema": "v1", "vocab": ["a"], "theta": [1, 2], "mu": [0], "sd": [1]}}
+        self.assertIn("model", tb._clean_friend(base))
+        for breakit in ({"theta": [1]}, {"mu": [0, 0]}, {"vocab": []}, {"theta": ["x", "y"]}):
+            bad = dict(base, model=dict(base["model"], **breakit))
+            self.assertNotIn("model", tb._clean_friend(bad), breakit)
+
+
+class TestRatedView(unittest.TestCase):
+    """The Liked/Disliked sheets read movies.md by status, cache-only."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.md = os.path.join(self.tmp, "movies.md")
+        with open(self.md, "w", encoding="utf-8") as f:
+            f.write(MOVIES_MD)
+        self._orig = (tb.MD_PATH, tb._poster_cache, tb._director_cache)
+        tb.MD_PATH = self.md
+        tb._poster_cache = {}
+        tb._director_cache = {}
+
+    def tearDown(self):
+        (tb.MD_PATH, tb._poster_cache, tb._director_cache) = self._orig
+
+    def test_filters_by_status(self):
+        self.assertEqual([m["id"] for m in tb.get_rated("3")], [111])
+        self.assertEqual([m["id"] for m in tb.get_rated("1")], [222])
+        self.assertEqual(tb.get_rated("9"), [])
+
+
+@unittest.skipUnless(HAS_NUMPY, "NumPy not installed")
+class TestMovieNight(unittest.TestCase):
+    """Group picker: rank normalization, tiers, exclusions, least misery."""
+
+    @staticmethod
+    def _features_stub(ids, cache, api_key=None, allow_network=True):
+        return {i: {} for i in ids}    # featurize falls back to base features (genres)
+
+    def test_rank01_ties_and_range(self):
+        r = rec._rank01([0.1, 0.9, 0.5, 0.5])
+        self.assertEqual(r.min(), 0.0)
+        self.assertEqual(r.max(), 1.0)
+        self.assertAlmostEqual(r[2], r[3])             # ties share a rank
+        self.assertTrue((rec._rank01([2.0]) == 1.0).all())
+
+    def test_tiers_exclusions_and_least_misery(self):
+        mv = lambda i, g: {"id": i, "title": "M%d" % i, "year": "2000", "genres": [g],
+                           "link": "", "poster": "", "overview": ""}
+        my_movies = [dict(mv(1, "Drama"), rating=3), dict(mv(2, "Horror"), rating=1)]
+        my_watch = [mv(10, "Drama"), mv(11, "Horror"), mv(12, "Drama")]
+        friend = {"name": "Anna",
+                  "likes": [mv(3, "Drama")], "dislikes": [mv(4, "Horror")],
+                  "watchlist": [mv(10, "Drama"), mv(11, "Horror"), mv(13, "Comedy")],
+                  "seen": [12]}                        # Anna already saw 12 -> excluded
+        orig = (rec.load_movies, rec.load_watchlist, rec.load_friends,
+                rec.not_interested_ids, rec.tf.get_features, rec.MODEL_PATH)
+        try:
+            rec.load_movies = lambda path=None: my_movies
+            rec.load_watchlist = lambda path=None: my_watch
+            rec.load_friends = lambda: [friend]
+            rec.not_interested_ids = lambda path=None: set()
+            rec.tf.get_features = self._features_stub
+            rec.MODEL_PATH = os.path.join(tempfile.mkdtemp(), "none.json")   # similarity for both
+            res = rec.movie_night(["Anna"], n=10, offline=True)
+        finally:
+            (rec.load_movies, rec.load_watchlist, rec.load_friends,
+             rec.not_interested_ids, rec.tf.get_features, rec.MODEL_PATH) = orig
+        ids = [p["id"] for p in res["picks"]]
+        self.assertNotIn(12, ids)
+        self.assertEqual(set(ids), {10, 11, 13})
+        tiers = {p["id"]: p["tier"] for p in res["picks"]}
+        self.assertEqual((tiers[10], tiers[11], tiers[13]), (0, 0, 1))
+        self.assertEqual(ids[0], 10)                   # both like Drama, both shun Horror
+        p10 = next(p for p in res["picks"] if p["id"] == 10)
+        self.assertEqual(p10["group_score"], min(p10["scores"].values()))   # least misery
+        self.assertEqual(res["how"], {"You": "similarity", "Anna": "similarity"})
+        self.assertEqual(res["missing"], [])
+
+    def test_friend_model_schema_gate(self):
+        feats = [{"genre=Drama": 1.0}]
+        good = {"schema": rec.MODEL_VERSION, "vocab": ["genre=Drama"],
+                "theta": [1.0, 0.0], "mu": [0.5], "sd": [0.5]}
+        _, how = rec._person_scores({"model": good, "likes": []}, feats, {})
+        self.assertEqual(how, "model")
+        _, how2 = rec._person_scores({"model": dict(good, schema="v999"), "likes": []}, feats, {})
+        self.assertEqual(how2, "none")                 # wrong schema, no likes -> neutral
+
+
 if __name__ == "__main__":
     unittest.main()

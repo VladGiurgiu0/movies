@@ -33,6 +33,7 @@ import os
 import sys
 import json
 import math
+import time
 import random
 import hashlib
 import tempfile
@@ -588,6 +589,7 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
                     result["cv"] = {"auc": float(np.nanmean(aucs)), "ap": float(np.nanmean(aps)), "k": k}
             model = train_logreg(Xtr, ytr, wtr)
             model["vocab"] = vec.vocab; model["cv"] = result["cv"]; model["data_sig"] = sig
+            model["version"] = MODEL_VERSION   # rides along into share exports
             _atomic_write(MODEL_PATH, json.dumps(model))
             vocab = vec.vocab
 
@@ -691,6 +693,204 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
     return result
 
 
+# --------------------------------------------------------------------------
+# Movie night — one film for the whole group.
+#
+# Everyone present is a participant: you, plus the imported friends named in
+# --party. Candidates come from the union of watchlists, in tiers (on
+# everyone's list -> on most -> on any -> fresh discover), filtered to your
+# streaming services. Every participant's taste scores every candidate — their
+# exported model when schema-compatible, else similarity to their likes and
+# dislikes — scores are rank-normalized onto a common [0,1] scale (rank
+# aggregation, cf. Baltrunas et al., RecSys 2010), and the group score is the
+# MINIMUM over participants: least misery (O'Connor et al., PolyLens 2001).
+# Nobody's evening gets sacrificed for the mean.
+# --------------------------------------------------------------------------
+PROVIDERS_CACHE = os.path.join(HERE, "providers_cache.json")
+PROVIDERS_TTL = 7 * 86400   # availability moves slowly; re-check weekly
+
+
+def _rank01(scores):
+    """Percentile ranks in [0,1] (ties averaged) — puts every participant's
+    scores on a common scale before group aggregation."""
+    s = np.asarray(scores, float)
+    n = len(s)
+    if n <= 1:
+        return np.ones(n)
+    order = np.argsort(s, kind="stable")
+    r = np.empty(n)
+    r[order] = np.arange(n, dtype=float)
+    u, inv = np.unique(s, return_inverse=True)
+    sums = np.zeros(len(u)); cnts = np.zeros(len(u))
+    np.add.at(sums, inv, r); np.add.at(cnts, inv, 1.0)
+    return (sums / cnts)[inv] / (n - 1)
+
+
+def _person_scores(person, cand_feats, metas):
+    """One participant's affinity for every candidate: their exported model when
+    its schema matches this code, else similarity to their likes/dislikes.
+    Returns (scores, how)."""
+    mdl = person.get("model")
+    if isinstance(mdl, dict) and str(mdl.get("schema")) == MODEL_VERSION:
+        try:
+            X = Vectorizer(mdl["vocab"]).transform(cand_feats)
+            return proba(mdl, X), "model"
+        except Exception:
+            pass
+    liked = [featurize(m, metas) for m in (person.get("likes") or [])]
+    disliked = [featurize(m, metas) for m in (person.get("dislikes") or [])]
+    if liked:
+        sc, _ = similarity_rank(cand_feats, liked, disliked)
+        return np.asarray(sc, float), "similarity"
+    return np.zeros(len(cand_feats)), "none"
+
+
+def _own_participant(movies):
+    """You, as a movie-night participant: the cached trained model when present
+    (even a slightly stale one beats retraining mid-party), else likes/dislikes."""
+    person = {"name": "You",
+              "likes": [m for m in movies if m["rating"] == 3],
+              "dislikes": [m for m in movies if m["rating"] == 1]}
+    try:
+        with open(MODEL_PATH, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        if (isinstance(m.get("vocab"), list) and isinstance(m.get("theta"), list)
+                and len(m["theta"]) == len(m["vocab"]) + 1):
+            person["model"] = {"schema": str(m.get("version", MODEL_VERSION)), "vocab": m["vocab"],
+                               "theta": m["theta"], "mu": m["mu"], "sd": m["sd"]}
+    except Exception:
+        pass
+    return person
+
+
+def _available_ids(ids, region, providers):
+    """Subset of ids streamable (flatrate) on the given providers in the given
+    region — the same semantics as the discover filter. Cached for a week; on a
+    failed lookup the film is kept (better a maybe than a wrongly dropped pick)."""
+    try:
+        with open(PROVIDERS_CACHE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    now = time.time()
+    out, dirty = set(), False
+    for mid in ids:
+        key = "%d:%s" % (mid, region)
+        ent = cache.get(key)
+        if not isinstance(ent, dict) or now - ent.get("ts", 0) > PROVIDERS_TTL:
+            try:
+                d = rater.tmdb_get("movie/%d/watch/providers" % mid, {}) or {}
+                flat = [p.get("provider_id") for p in
+                        (((d.get("results") or {}).get(region) or {}).get("flatrate") or [])]
+                ent = {"ts": now, "flatrate": [int(x) for x in flat if x is not None]}
+                cache[key] = ent; dirty = True
+            except Exception:
+                out.add(mid)      # unknown -> keep, don't cache
+                continue
+        if set(ent.get("flatrate") or []) & providers:
+            out.add(mid)
+    if dirty:
+        try:
+            _atomic_write(PROVIDERS_CACHE, json.dumps(cache))
+        except Exception:
+            pass
+    return out
+
+
+def movie_night(party, n=8, offline=False):
+    """Pick films for the group: you + the named imported friends."""
+    movies = load_movies()
+    watchlist = load_watchlist()
+    by_name = {(f.get("name") or "a friend"): f for f in load_friends()}
+    people = [_own_participant(movies)]
+    missing = []
+    for name in party:
+        if name in by_name:
+            p = dict(by_name[name]); p["name"] = name
+            people.append(p)
+        else:
+            missing.append(name)
+    result = {"participants": [p["name"] for p in people], "missing": missing,
+              "picks": [], "how": {}, "filtered_by_providers": False, "message": ""}
+
+    # exclusions: anything anyone has seen, or you've dismissed
+    seen = {m["id"] for m in movies if m["rating"] in (1, 2, 3)} | not_interested_ids()
+    for p in people[1:]:
+        seen |= {int(x) for x in (p.get("seen") or []) if isinstance(x, int)}
+        seen |= {m["id"] for m in (p.get("dislikes") or [])}   # older exports carry no "seen"
+
+    # candidates from the union of watchlists, tiered by how many lists carry them
+    k = len(people)
+    wls = [("You", watchlist)] + [(p["name"], p.get("watchlist") or []) for p in people[1:]]
+    cand, onlists = {}, {}
+    for pname, wl in wls:
+        for m in wl:
+            mid = m.get("id")
+            if not isinstance(mid, int) or mid in seen:
+                continue
+            g = m.get("genres")
+            cand.setdefault(mid, {"id": mid, "title": m.get("title", ""), "year": str(m.get("year", "")),
+                                  "genres": g if isinstance(g, list) else _split_genres(g or ""),
+                                  "link": m.get("link", ""), "poster": "", "overview": ""})
+            onlists.setdefault(mid, set()).add(pname)
+
+    # where-to-watch filter (yours — you're all in the same room)
+    if not offline and rater is not None and cand:
+        try:
+            prefs = rater.load_providers() or {}
+        except Exception:
+            prefs = {}
+        region = prefs.get("region"); provs = {int(x) for x in (prefs.get("providers") or [])}
+        if region and provs:
+            keep = _available_ids(sorted(cand), region, provs)
+            cand = {i: m for i, m in cand.items() if i in keep}
+            result["filtered_by_providers"] = True
+
+    pool = list(cand.values())
+    tier_of = {m["id"]: k - len(onlists[m["id"]]) for m in pool}   # 0 = on everyone's list
+
+    # final tier: fresh discover (channels already apply the providers filter)
+    if len(pool) < n and not offline:
+        for m in discover_pool(seen | set(cand), cap=POOL_CAP):
+            tier_of[m["id"]] = k
+            pool.append(m)
+
+    if not pool:
+        result["message"] = ("Nothing left to pick from — add films to your watchlists, "
+                             "or relax the streaming filter.")
+        return result
+
+    # everyone scores everything
+    need = {m["id"] for m in pool}
+    for p in people:
+        mdl = p.get("model")
+        if not (isinstance(mdl, dict) and str(mdl.get("schema")) == MODEL_VERSION):
+            need |= {m["id"] for m in (p.get("likes") or [])}
+            need |= {m["id"] for m in (p.get("dislikes") or [])}
+    metas = tf.get_features(sorted(need), CACHE, api_key=tf.resolve_api_key(),
+                            allow_network=not offline)
+    cand_feats = [featurize(m, metas) for m in pool]
+    rows = []
+    for p in people:
+        sc, how = _person_scores(p, cand_feats, metas)
+        rows.append(_rank01(sc))
+        result["how"][p["name"]] = how
+    P = np.vstack(rows)                     # participants x candidates
+    group = P.min(axis=0)                   # least misery
+    weakest = P.argmin(axis=0)
+
+    order = sorted(range(len(pool)), key=lambda i: (tier_of[pool[i]["id"]], -group[i]))
+    for i in order[:n]:
+        m = dict(pool[i])
+        mid = m["id"]
+        m.update({"tier": tier_of[mid], "on": sorted(onlists.get(mid, ())),
+                  "group_score": round(float(group[i]), 3),
+                  "scores": {p["name"]: round(float(P[j, i]), 3) for j, p in enumerate(people)},
+                  "weakest": people[int(weakest[i])]["name"]})
+        result["picks"].append(m)
+    return result
+
+
 def write_recommendations(result):
     head = "trained model" if result["mode"] == "model" else "content similarity"
     lines = ["# Recommendations\n",
@@ -729,6 +929,8 @@ def main():
     ap.add_argument("--exclude", default="", help="comma-separated ids already shown this session")
     ap.add_argument("--rebuild-cache", action="store_true", help="delete the metadata cache and refetch")
     ap.add_argument("--json", action="store_true", help="emit JSON to stdout (for the rater UI)")
+    ap.add_argument("--movie-night", action="store_true", help="pick films for a group (you + --party)")
+    ap.add_argument("--party", default="[]", help='JSON list of imported friend names joining movie night')
     args = ap.parse_args()
     if args.rebuild_cache:
         try:
@@ -736,6 +938,14 @@ def main():
                 os.remove(CACHE)
         except Exception:
             pass
+    if args.movie_night:
+        try:
+            party = [str(x) for x in json.loads(args.party or "[]")]
+        except Exception:
+            party = []
+        result = movie_night(party, n=args.n, offline=args.offline)
+        print(json.dumps(result) if args.json else json.dumps(result, indent=2))
+        return
     excl = {int(x) for x in args.exclude.split(",") if x.strip().isdigit()}
     result = run(n=args.n, source=args.source, offline=args.offline,
                  train_only=args.train_only, explore=args.explore,

@@ -30,9 +30,11 @@ dependency (NumPy).
 - **Four verdicts** on an ordinal scale plus a separate watchlist:
   - `3` Liked · `2` Indifferent · `1` Disliked · `0` Not seen
   - **Add to Watchlist** for "want to watch later"
-- **Your watchlist, one tap away** — click the **Watchlist** count to slide up a
-  sheet of everything you've saved, each with its poster; mark one **watched**
-  (it moves into your ratings), remove it, or open it on TMDb.
+- **Your lists, one tap away** — the stats line sits above the card, visible on
+  both faces. Click the **Watchlist** count to slide up a sheet of everything
+  you've saved, each with its poster; mark one **watched** (it moves into your
+  ratings), remove it, or open it on TMDb. The **Liked** and **Disliked** counts
+  open the same sheet for your rating history, where you can re-rate any film.
 - **Channels** — the pools your movies come from, built four ways: by **genre**,
   **"more like a movie"** you love (TMDb's neighbours of a seed film), **films by
   a person** (a director or actor), or a **keyword** (a real TMDb tag, picked from
@@ -56,10 +58,21 @@ dependency (NumPy).
   **Next** button and a **Safe / Balanced / Exploratory** control; rate /
   add-to-watchlist / mark *Not interested* on any pick inline. Powered by
   [`ml-recommender/`](ml-recommender/).
-- **Share & friends** — **export your liked films** to a small file (the
-  **Share** button on the rater), and **import friends' libraries** (the
-  **Friends** panel on the recommender) — one database per friend. A **"from"
-  menu** switches whose taste you recommend from: *your* taste or any friend's.
+- **Share & friends** — **export your taste** to a small file (the **Share**
+  button on the rater): your liked and disliked films, your watchlist, the ids
+  of what you've seen, and — once trained — your **taste model**. **Import
+  friends' files** (the **Friends** panel on the recommender) — one database per
+  friend; older likes-only files still import fine. A **"from" menu** switches
+  whose taste you recommend from: *your* taste or any friend's.
+- **Movie night** — flip the **light switch** above the card and the lights go
+  down: a projector screen takes the card's place. Check in the buddies who are
+  there, start the projector, and it picks **one film for all of you**:
+  candidates come from everyone's watchlists in tiers (on *everyone's* list
+  first, then *most*, then *any*, then a fresh pick), filtered to your streaming
+  services. Every participant's taste scores every candidate — their exported
+  model when available, otherwise similarity to their likes and dislikes — and
+  the group pick is decided by **least misery** (the film nobody would hate),
+  with each person's match shown on screen.
 - **Guided first run** — on a fresh start, a short onboarding helps you paste your
   TMDb key, make your first channel (just name a film you love), and learn how
   rating works — so there's something to do from minute one.
@@ -149,7 +162,7 @@ pools just need to point in roughly the right direction. Channels live in
 | `watchlist.md` | **no** (git-ignored) | your personal watchlist |
 | `not-interested.md` | **no** (git-ignored) | films you marked *Not interested* |
 | `providers.json` | **no** (git-ignored) | your country + chosen streaming services |
-| `friends.json` | **no** (git-ignored) | imported friends' liked films (one entry per friend) |
+| `friends.json` | **no** (git-ignored) | imported friends (one entry per friend: likes, dislikes, watchlist, seen ids, and their taste model when shared) |
 | `director_cache.json` | **no** (git-ignored) | cached director names — auto-created, makes cards load faster |
 | `poster_cache.json` | **no** (git-ignored) | cached poster paths for the watchlist view — auto-created |
 | `model_weights.json` | **no** (git-ignored) | how strongly each reaction trains your model — set in the Model panel |

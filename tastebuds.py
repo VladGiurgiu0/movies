@@ -692,15 +692,78 @@ def liked_export():
             for e in _library_entries().values() if e["status"] == "3"]
 
 
+SHARE_VERSION = 2   # share-file payload format
+
+
+def _portable_model():
+    """Your trained model in a friend-portable shape (vocab + weights + scaling +
+    schema version), or None when no model has been trained yet."""
+    path = os.path.join(ML_DIR, "model.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        vocab, theta, mu, sd = m.get("vocab"), m.get("theta"), m.get("mu"), m.get("sd")
+        if not (isinstance(vocab, list) and isinstance(theta, list) and len(theta) == len(vocab) + 1):
+            return None
+        if not all(isinstance(v, list) and len(v) == len(vocab) for v in (mu, sd)):
+            return None
+        return {"schema": str(m.get("version", "v1")), "vocab": vocab, "theta": theta,
+                "mu": mu, "sd": sd, "cv": m.get("cv")}
+    except Exception:
+        return None
+
+
+def share_export():
+    """Everything a friend needs — likes, dislikes, watchlist, seen ids, and (when
+    trained) your taste model — in one portable, versioned payload."""
+    lib = list(_library_entries().values())
+    def pick(e):
+        return {"id": e["id"], "title": e["title"], "year": e["year"],
+                "genres": e["genres"], "link": e["link"]}
+    out = {"app": "tastebuds", "version": SHARE_VERSION,
+           "likes":     [pick(e) for e in lib if e["status"] == "3"],
+           "dislikes":  [pick(e) for e in lib if e["status"] == "1"],
+           "watchlist": [pick(e) for e in lib if e["status"] == "watchlist"],
+           "seen":      sorted(e["id"] for e in lib if e["status"] in ("1", "2", "3"))}
+    model = _portable_model()
+    if model:
+        out["model"] = model
+    return out
+
+
 def _clean_friend(data):
-    """Sanitize one imported friend record (name + capped likes)."""
+    """Sanitize one imported friend record: name, capped film lists, seen ids,
+    and (when present and well-formed) their portable taste model. Old likes-only
+    share files import fine — the extra fields just stay empty."""
     name = (str(data.get("name") or "").strip() or "a friend")[:60]
-    likes = []
-    for m in (data.get("likes") or [])[:5000]:   # cap an imported file to a sane size
-        if isinstance(m, dict) and str(m.get("id", "")).isdigit():
-            likes.append({"id": int(m["id"]), "title": str(m.get("title", "")), "year": str(m.get("year", "")),
-                          "genres": m.get("genres", ""), "link": str(m.get("link", ""))})
-    return {"name": name, "likes": likes}
+
+    def films(key, cap):
+        out = []
+        for m in (data.get(key) or [])[:cap]:   # cap an imported file to a sane size
+            if isinstance(m, dict) and str(m.get("id", "")).isdigit():
+                out.append({"id": int(m["id"]), "title": str(m.get("title", "")), "year": str(m.get("year", "")),
+                            "genres": m.get("genres", ""), "link": str(m.get("link", ""))})
+        return out
+
+    fr = {"name": name, "likes": films("likes", 5000), "dislikes": films("dislikes", 5000),
+          "watchlist": films("watchlist", 2000),
+          "seen": sorted({int(x) for x in (data.get("seen") or [])[:20000]
+                          if (isinstance(x, int) and x > 0)
+                          or (isinstance(x, str) and x.isdigit())})}
+    mdl = data.get("model")
+    if isinstance(mdl, dict):
+        vocab, theta, mu, sd = mdl.get("vocab"), mdl.get("theta"), mdl.get("mu"), mdl.get("sd")
+        if (isinstance(vocab, list) and isinstance(theta, list) and 0 < len(vocab) <= 20000
+                and len(theta) == len(vocab) + 1
+                and all(isinstance(v, list) and len(v) == len(vocab) for v in (mu, sd))
+                and all(isinstance(t, (int, float)) for t in theta)):
+            fr["model"] = {"schema": str(mdl.get("schema", "")), "vocab": [str(v) for v in vocab],
+                           "theta": [float(t) for t in theta],
+                           "mu": [float(v) for v in mu], "sd": [float(v) for v in sd],
+                           "cv": mdl.get("cv") if isinstance(mdl.get("cv"), dict) else None}
+    return fr
 
 
 def load_friends():
@@ -726,8 +789,9 @@ def load_friends():
 
 
 def friends_info():
-    """Lightweight list for the UI: name + how many liked films, no payload."""
-    return [{"name": d.get("name") or "a friend", "count": len(d.get("likes") or [])}
+    """Lightweight list for the UI: name + counts + whether a model came along."""
+    return [{"name": d.get("name") or "a friend", "count": len(d.get("likes") or []),
+             "watch": len(d.get("watchlist") or []), "model": bool(d.get("model"))}
             for d in load_friends()]
 
 
@@ -977,6 +1041,21 @@ def get_watchlist():
                           "link": c[4] if len(c) > 4 else f"https://www.themoviedb.org/movie/{mid}",
                           "poster": _poster_cached(mid), "director": _director_cached(mid)})
     items.reverse()   # most recently added on top
+    return items
+
+
+def get_rated(status):
+    """Films you rated with a given status ('3' liked … '0' not seen), newest
+    first, enriched from caches only (posters fill in lazily via /api/poster)."""
+    items = []
+    for line in _table_lines(MD_PATH):   # | Rating | Status | Title | Year | Genres | TMDb ID | Link | ... |
+        c = [x.strip() for x in line.strip().strip("|").split("|")]
+        if len(c) > MD_ID_COL and c[MD_ID_COL].isdigit() and c[0] == status:
+            mid = int(c[MD_ID_COL])
+            items.append({"id": mid, "title": c[2], "year": c[3], "genres": c[4],
+                          "link": c[6] if len(c) > 6 else f"https://www.themoviedb.org/movie/{mid}",
+                          "poster": _poster_cached(mid), "director": _director_cached(mid)})
+    items.reverse()   # most recently rated on top
     return items
 
 
@@ -1374,9 +1453,69 @@ PAGE = r"""<!DOCTYPE html>
   .wrow .wv{width:40px;text-align:right;font-size:13px;font-weight:600}
   .mwarn{font-size:12px;color:var(--coral);margin-top:8px;min-height:14px;letter-spacing:-.01em}
   .primarybtn:disabled{opacity:.45;cursor:default}
+
+  /* Movie night: the lights go down and a projector takes the card's place */
+  .topline{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0 0 10px;padding:0 8px}
+  .nightctl{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+  .nlabel{font-size:12.5px;color:var(--muted);letter-spacing:-.01em}
+  .lswitch{appearance:none;width:46px;height:26px;border-radius:980px;border:1px solid var(--line);
+           background:var(--gray-tint);position:relative;cursor:pointer;padding:0;transition:background .3s ease}
+  .lswitch .knob{position:absolute;top:2.5px;left:3px;width:19px;height:19px;border-radius:50%;
+           background:var(--card);box-shadow:0 1px 4px rgba(0,0,0,.35);transition:left .3s cubic-bezier(.4,0,.2,1)}
+  .lswitch.on{background:var(--violet);border-color:var(--violet)}
+  .lswitch.on .knob{left:23px}
+  body.night{background:#0b0b0d}
+  body.night::after{content:'';position:fixed;inset:0;z-index:1;pointer-events:none;
+           background:radial-gradient(ellipse at 50% 28%, transparent 35%, rgba(0,0,0,.6) 100%)}
+  body.night .bar{opacity:.3}
+  body.night .tally{opacity:0;pointer-events:none;transition:opacity .5s ease}
+  body.night .nlabel{color:#b9b5aa}
+  .night-wrap{position:relative;z-index:2}
+  .screen-frame{background:#141416;border:1px solid #29292e;border-radius:26px;padding:30px;
+           box-shadow:0 40px 90px -30px rgba(0,0,0,.9)}
+  .screen{position:relative;border-radius:14px;min-height:470px;overflow:hidden;display:flex;
+           align-items:center;justify-content:center;background:
+           radial-gradient(ellipse at 50% -12%, rgba(255,255,248,.5), transparent 55%),
+           linear-gradient(180deg,#f1eee4,#d9d5c7)}
+  .screen .grain{position:absolute;inset:-75%;z-index:3;pointer-events:none;opacity:.09;
+           background:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="2" stitchTiles="stitch"/></filter><rect width="100%" height="100%" filter="url(%23n)"/></svg>');
+           animation:grain .85s steps(5) infinite}
+  @keyframes grain{0%{transform:translate(0,0)}20%{transform:translate(-2%,1.6%)}40%{transform:translate(1.4%,-2.2%)}
+           60%{transform:translate(-1.8%,-1%)}80%{transform:translate(2.2%,1.2%)}100%{transform:translate(0,0)}}
+  .proj{position:relative;z-index:2;text-align:center;color:#272219;padding:30px 26px;max-width:600px}
+  .proj.roll{animation:flick 1.05s linear}
+  @keyframes flick{0%{opacity:0;filter:brightness(2.6) contrast(.55)}7%{opacity:.85}11%{opacity:.15}
+           17%{opacity:.95;filter:brightness(1.7) contrast(.8)}24%{opacity:.45}33%{opacity:1;filter:brightness(1.2)}
+           52%{filter:brightness(.96)}70%{filter:brightness(1.04)}100%{opacity:1;filter:none}}
+  .proj .pp{width:190px;border-radius:10px;box-shadow:0 18px 44px rgba(0,0,0,.38);margin:0 auto 16px;display:block}
+  .proj .pp-ph{width:190px;height:285px;border-radius:10px;background:rgba(60,50,30,.14);margin:0 auto 16px;
+           display:flex;align-items:center;justify-content:center;color:rgba(60,50,30,.4)}
+  .proj .pp-ph svg{width:34px;height:34px}
+  .proj h1{font-size:27px;font-weight:600;letter-spacing:-.02em;margin:0 0 6px;line-height:1.12}
+  .proj h1 .yr{font-weight:400;opacity:.55}
+  .proj .pmeta{font-size:13.5px;opacity:.65;margin-bottom:10px;letter-spacing:-.01em}
+  .proj .ptier{font-size:13px;font-weight:600;margin-bottom:4px;letter-spacing:-.01em}
+  .proj .pscores{font-size:12px;opacity:.6;letter-spacing:-.01em}
+  .proj .pidle{font-size:15px;opacity:.55;line-height:1.7;max-width:380px;margin:0 auto}
+  .proj a{color:inherit}
+  .night-panel{margin-top:14px;background:#141416;border:1px solid #29292e;border-radius:18px;
+           padding:15px 18px;color:#d8d4c9}
+  .np-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+  .np-lbl{font-size:12px;color:#8d897f;letter-spacing:-.01em;margin-right:2px}
+  .npf{appearance:none;font:inherit;font-size:12.5px;letter-spacing:-.01em;cursor:pointer;border-radius:980px;
+           padding:5px 13px;border:1px solid #34343b;background:#1d1d21;color:#cfccc2}
+  .npf.on{background:var(--blue);border-color:var(--blue);color:#fff}
+  .npf.you{cursor:default;background:#2a2a30;color:#efece2}
+  .night-panel .ghost{background:#26262b;color:#d8d4c9}
+  .np-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .night-panel .note{color:#8d897f}
 </style></head>
 <body>
   <div class="page">
+    <div class="topline">
+      <div class="tally" id="tally" style="text-align:left"></div>
+      <div class="nightctl"><span class="nlabel">Movie night</span><button class="lswitch" id="night-switch" aria-label="Toggle movie night" title="Movie night: one film for you and your buddies"><span class="knob"></span></button></div>
+    </div>
     <div class="flip-wrap" id="flipwrap">
      <div class="flip" id="flip">
 
@@ -1393,7 +1532,6 @@ PAGE = r"""<!DOCTYPE html>
           </div>
           <button class="flipbtn" id="to-rec">Get recommendations<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5l7 7-7 7"/><path d="M20 12H4"/></svg></button>
         </div>
-        <div class="tally" id="tally" style="text-align:left;margin:-2px 0 12px"></div>
         <div id="card"><div class="msg">Loading.</div></div>
         <div class="cardfoot"><button class="undo" id="undo"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-2"/></svg>Undo last action</button></div>
       </div>
@@ -1428,6 +1566,23 @@ PAGE = r"""<!DOCTYPE html>
       </div>
 
      </div>
+    </div>
+
+    <div class="night-wrap" id="night-wrap" hidden>
+      <div class="screen-frame">
+        <div class="screen">
+          <div class="proj" id="proj"></div>
+          <div class="grain"></div>
+        </div>
+      </div>
+      <div class="night-panel">
+        <div class="np-row" id="night-party"></div>
+        <div class="np-actions">
+          <button class="primarybtn" id="night-pick">Start the projector</button>
+          <button class="ghost" id="night-providers">Where you watch</button>
+          <span class="note" id="night-note"></span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1533,9 +1688,9 @@ PAGE = r"""<!DOCTYPE html>
   <div class="overlay" id="export-overlay">
     <div class="panel" id="export-panel">
       <div class="phead"><h2>Share your library</h2><button class="x" id="close-export">&times;</button></div>
-      <p class="desc">Export the films you've <b>liked</b> to a small file you can send a friend. They import it under Recommendations → <b>Friends</b> to get recommended what you loved.</p>
+      <p class="desc">Export your taste to a small file you can send a friend: your <b>liked</b> and <b>disliked</b> films, your <b>watchlist</b>, and (once trained) your <b>taste model</b>. They import it under Recommendations → <b>Friends</b> — for recommendations from your taste, and for <b>Movie night</b>.</p>
       <div class="fld"><label>Your name (optional — shown to friends)</label><input id="share-name" placeholder="e.g. Vlad" autocomplete="off"></div>
-      <button class="primarybtn" id="do-export">Export my likes</button>
+      <button class="primarybtn" id="do-export">Export my taste</button>
       <span class="note" id="export-note"></span>
     </div>
   </div>
@@ -1619,7 +1774,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="wl-sheet" id="wl-sheet">
       <div class="wl-grip" id="wl-grip"></div>
       <div class="wl-head">
-        <h2>Watchlist <span class="wl-cnt" id="wl-cnt"></span></h2>
+        <h2><span id="wl-title">Watchlist</span> <span class="wl-cnt" id="wl-cnt"></span></h2>
         <button class="x" id="wl-close">&times;</button>
       </div>
       <div class="wl-list" id="wl-list"></div>
@@ -1655,9 +1810,11 @@ function setTally(s){
   const el = document.getElementById('tally');
   if(s){
     el.innerHTML =
-      'Liked <b>'+s['3']+'</b> &middot; Indifferent <b>'+s['2']+'</b> &middot; ' +
-      'Disliked <b>'+s['1']+'</b> &middot; Not seen <b>'+s['0']+'</b> &middot; ' +
-      '<button class="tally-wl" onclick="openWatchlist()" title="View your watchlist">Watchlist <b>'+s['watch']+'</b></button>';
+      '<button class="tally-wl" onclick="openListSheet(\'3\')" title="View the films you liked">Liked <b>'+s['3']+'</b></button> &middot; ' +
+      'Indifferent <b>'+s['2']+'</b> &middot; ' +
+      '<button class="tally-wl" onclick="openListSheet(\'1\')" title="View the films you disliked">Disliked <b>'+s['1']+'</b></button> &middot; ' +
+      'Not seen <b>'+s['0']+'</b> &middot; ' +
+      '<button class="tally-wl" onclick="openListSheet(\'watch\')" title="View your watchlist">Watchlist <b>'+s['watch']+'</b></button>';
   } else { el.innerHTML=''; }
 }
 
@@ -2167,14 +2324,16 @@ function openExport(){ document.getElementById('export-overlay').classList.add('
 function closeExport(){ document.getElementById('export-overlay').classList.remove('open'); exportOpen = false; }
 async function doExport(){
   const note = document.getElementById('export-note');
-  let d; try { d = await (await fetch('/api/likes')).json(); } catch(e){ note.textContent = ' Export failed.'; return; }
+  let payload; try { payload = (await (await fetch('/api/share')).json()).share; } catch(e){ note.textContent = ' Export failed.'; return; }
+  if(!payload){ note.textContent = ' Export failed.'; return; }
   const name = document.getElementById('share-name').value.trim();
-  const payload = {app:'tastebuds', name:name, exported:new Date().toISOString().slice(0,10), likes:(d.likes||[])};
-  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+  payload.name = name; payload.exported = new Date().toISOString().slice(0,10);
+  const blob = new Blob([JSON.stringify(payload)], {type:'application/json'});
   const url = URL.createObjectURL(blob); const a = document.createElement('a');
-  a.href = url; a.download = (name ? name.replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'-' : '') + 'likes.json';
+  a.href = url; a.download = (name ? name.replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'-' : '') + 'tastebuds.json';
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  note.textContent = ' Exported '+(d.likes||[]).length+' liked films.';
+  note.textContent = ' Exported '+(payload.likes||[]).length+' liked, '+(payload.dislikes||[]).length+' disliked, '+
+    (payload.watchlist||[]).length+' watchlist'+(payload.model?', and your taste model.':'.');
 }
 document.getElementById('open-export').onclick = openExport;
 document.getElementById('close-export').onclick = closeExport;
@@ -2190,7 +2349,7 @@ function renderFriendsList(){
   if(!friends.length){ box.innerHTML = '<div class="note">No friends imported yet.</div>'; return; }
   box.innerHTML = friends.map((f,i)=>
     '<div class="friend-row" data-i="'+i+'"><div class="fn">'+esc(f.name)+'</div>'+
-      '<div class="fc">'+f.count+' liked</div>'+
+      '<div class="fc">'+f.count+' liked'+(f.watch?' · '+f.watch+' watchlist':'')+(f.model?' · model':'')+'</div>'+
       '<button class="ghost frm">Remove</button></div>').join('');
   box.querySelectorAll('.friend-row').forEach(row=>{
     const i = parseInt(row.dataset.i,10);
@@ -2217,7 +2376,7 @@ function populateProfileSelect(){
 }
 async function refreshFriends(){
   try { friends = (await (await fetch('/api/friends')).json()).friends || []; } catch(e){ friends = []; }
-  renderFriendsList(); populateProfileSelect();
+  renderFriendsList(); populateProfileSelect(); renderNightParty();
 }
 function doImport(ev){
   const file = ev.target.files && ev.target.files[0]; if(!file) return;
@@ -2227,8 +2386,8 @@ function doImport(ev){
     let data; try { data = JSON.parse(reader.result); } catch(e){ note.textContent = 'That file is not valid JSON.'; return; }
     try {
       const res = await (await fetch('/api/import-friend',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({name:data.name||'', likes:data.likes||[]})})).json();
-      friends = res.friends || []; renderFriendsList(); populateProfileSelect();
+        body:JSON.stringify(data)})).json();
+      friends = res.friends || []; renderFriendsList(); populateProfileSelect(); renderNightParty();
       note.textContent = 'Imported '+(res.name||'a friend')+' ('+(res.count||0)+' liked films). Pick them in the “from” menu.';
     } catch(e){ note.textContent = 'Import failed.'; }
   };
@@ -2240,7 +2399,7 @@ async function removeFriend(name){
       body:JSON.stringify({name:name})})).json();
     friends = res.friends || [];
   } catch(e){}
-  renderFriendsList(); populateProfileSelect();
+  renderFriendsList(); populateProfileSelect(); renderNightParty();
 }
 document.getElementById('open-friends').onclick = openFriends;
 document.getElementById('close-friends').onclick = closeFriends;
@@ -2329,14 +2488,24 @@ let watchlistOpen=false, wlPosterObserver=null;
 const WL_FILM='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M3 9.5h18M8.5 4v16"/></svg>';
 const WL_LINK='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
 
-async function openWatchlist(){
+let wlKind='watch';   // 'watch' | '3' (liked) | '1' (disliked)
+const WL_META={watch:{title:'Watchlist', url:'/api/watchlist',
+                      empty:'Nothing saved yet.<br>Tap <b>Add to Watchlist</b> on a film to keep it here.'},
+               '3':{title:'Liked', url:'/api/rated?status=3',
+                      empty:'No liked films yet.<br>Rate a few — the ones you <b>like</b> collect here.'},
+               '1':{title:'Disliked', url:'/api/rated?status=1',
+                      empty:'No disliked films yet.<br>Rate the misses too — dislikes sharpen your recommendations.'}};
+async function openListSheet(kind){
+  wlKind = WL_META[kind] ? kind : 'watch';
   const overlay=document.getElementById('wl-overlay'), sheet=document.getElementById('wl-sheet'), list=document.getElementById('wl-list');
+  document.getElementById('wl-title').textContent = WL_META[wlKind].title;
   list.innerHTML='<div class="wl-empty">Loading…</div>';
   overlay.classList.add('open'); watchlistOpen=true;
   requestAnimationFrame(()=>requestAnimationFrame(()=>sheet.classList.add('up')));
-  let items=[]; try{ items=(await (await fetch('/api/watchlist')).json()).items||[]; }catch(e){}
+  let items=[]; try{ items=(await (await fetch(WL_META[wlKind].url)).json()).items||[]; }catch(e){}
   renderWatchlist(items);
 }
+function openWatchlist(){ return openListSheet('watch'); }
 function closeWatchlist(){
   const overlay=document.getElementById('wl-overlay'), sheet=document.getElementById('wl-sheet');
   sheet.classList.remove('up'); watchlistOpen=false;
@@ -2346,7 +2515,17 @@ function wlCount(n){ document.getElementById('wl-cnt').textContent = n+(n===1?' 
 function renderWatchlist(items){
   const list=document.getElementById('wl-list');
   wlCount(items.length);
-  if(!items.length){ list.innerHTML='<div class="wl-empty">Nothing saved yet.<br>Tap <b>Add to Watchlist</b> on a film to keep it here.</div>'; return; }
+  if(!items.length){ list.innerHTML='<div class="wl-empty">'+WL_META[wlKind].empty+'</div>'; return; }
+  const isWatch = wlKind==='watch';
+  const verdicts = isWatch
+    ? '<span class="lbl">Mark watched</span>'+
+      '<button class="wl-vb like" data-r="3">Liked</button>'+
+      '<button class="wl-vb meh" data-r="2">Indifferent</button>'+
+      '<button class="wl-vb dis" data-r="1">Disliked</button>'
+    : '<span class="lbl">Re-rate</span>'+
+      (wlKind!=='3'?'<button class="wl-vb like" data-r="3">Liked</button>':'')+
+      '<button class="wl-vb meh" data-r="2">Indifferent</button>'+
+      (wlKind!=='1'?'<button class="wl-vb dis" data-r="1">Disliked</button>':'');
   list.innerHTML=items.map(m=>{
     const genres=(m.genres||'').split(',').map(g=>g.trim()).filter(Boolean).map(esc).join(' · ');
     const dir=m.director?esc(m.director):'';
@@ -2356,20 +2535,17 @@ function renderWatchlist(items){
     return '<div class="wl-item" data-id="'+m.id+'">'+thumb+
       '<div class="wl-info">'+
         '<div class="wl-row1"><div class="wl-t">'+esc(m.title)+' <span class="yr">('+esc(String(m.year||''))+')</span></div>'+
-          '<div class="wl-ic"><button class="wl-rm" aria-label="Remove from watchlist">'+TRASH_SVG+'</button>'+
+          '<div class="wl-ic">'+(isWatch?'<button class="wl-rm" aria-label="Remove from watchlist">'+TRASH_SVG+'</button>':'')+
             '<a href="'+escAttr(m.link)+'" target="_blank" rel="noopener" aria-label="Open on TMDb">'+WL_LINK+'</a></div></div>'+
         (meta?('<div class="wl-g">'+meta+'</div>'):'<div class="wl-g"></div>')+
-        '<div class="wl-watch"><span class="lbl">Mark watched</span>'+
-          '<button class="wl-vb like" data-r="3">Liked</button>'+
-          '<button class="wl-vb meh" data-r="2">Indifferent</button>'+
-          '<button class="wl-vb dis" data-r="1">Disliked</button></div>'+
+        '<div class="wl-watch">'+verdicts+'</div>'+
       '</div></div>';
   }).join('');
   list.querySelectorAll('.wl-item').forEach(it=>{
     const id=+it.dataset.id, m=items.find(x=>x.id===id);
     it.querySelectorAll('.wl-vb').forEach(b=>b.onclick=()=>wlAct(it,'/api/setstatus',
       {movie:{id:m.id,title:m.title,year:m.year,genres:m.genres,link:m.link}, status:b.dataset.r}));
-    it.querySelector('.wl-rm').onclick=()=>wlAct(it,'/api/wl-remove',{id:m.id});
+    const rm=it.querySelector('.wl-rm'); if(rm) rm.onclick=()=>wlAct(it,'/api/wl-remove',{id:m.id});
   });
   lazyPosters();
 }
@@ -2394,6 +2570,94 @@ function lazyPosters(){
 document.getElementById('wl-close').onclick = closeWatchlist;
 document.getElementById('wl-grip').onclick = closeWatchlist;
 document.getElementById('wl-overlay').onclick = e=>{ if(e.target.id==='wl-overlay') closeWatchlist(); };
+
+/* ---- Movie night: lights off, projector on ---- */
+let nightOn=false, nightPicks=[], nightIdx=-1, nightParty=new Set();
+try{ nightParty=new Set(JSON.parse(localStorage.getItem('nightParty')||'[]')); }catch(e){}
+function nightToggle(){
+  nightOn=!nightOn;
+  document.body.classList.toggle('night', nightOn);
+  document.getElementById('night-switch').classList.toggle('on', nightOn);
+  document.getElementById('flipwrap').style.display = nightOn?'none':'';
+  document.getElementById('night-wrap').hidden = !nightOn;
+  if(nightOn){ projIdle(); refreshFriends(); }
+}
+function projIdle(){
+  nightPicks=[]; nightIdx=-1;
+  const btn=document.getElementById('night-pick'); btn.textContent='Start the projector'; btn.disabled=false;
+  document.getElementById('night-note').textContent='';
+  const el=document.getElementById('proj'); el.classList.remove('roll');
+  el.innerHTML='<div class="pidle">The lights are off. Check in the buddies who are here tonight, then start the projector — it picks one film for all of you.</div>';
+}
+function renderNightParty(){
+  const row=document.getElementById('night-party'); if(!row) return;
+  nightParty=new Set([...nightParty].filter(n=>friends.some(f=>f.name===n)));
+  try{ localStorage.setItem('nightParty', JSON.stringify([...nightParty])); }catch(e){}
+  row.innerHTML='<span class="np-lbl">Tonight:</span><button class="npf you" tabindex="-1">You</button>'+
+    friends.map(f=>'<button class="npf'+(nightParty.has(f.name)?' on':'')+'" data-n="'+escAttr(f.name)+'" title="'+
+      (f.model?'Taste model imported':'No taste model in their file — scored by similarity to their likes')+'">'+esc(f.name)+'</button>').join('')+
+    '<button class="ghost" id="night-add">Add a buddy</button>';
+  row.querySelectorAll('.npf[data-n]').forEach(b=>b.onclick=()=>{
+    const n=b.dataset.n; if(nightParty.has(n)) nightParty.delete(n); else nightParty.add(n);
+    const had=nightPicks.length; renderNightParty(); if(had) projIdle();   // party changed -> picks are stale
+  });
+  const add=document.getElementById('night-add');
+  if(add) add.onclick=()=>document.getElementById('friend-file').click();
+}
+function tierLine(p){
+  const k=p.scores?Object.keys(p.scores).length:1;
+  if(p.tier===0) return k>1?"On everyone's watchlist":"On your watchlist";
+  if(p.tier>=k) return "A fresh pick — on nobody's list yet";
+  return 'On '+(k-p.tier)+' of '+k+' watchlists'+(p.on&&p.on.length?' — '+p.on.map(esc).join(', '):'');
+}
+function project(p){
+  const el=document.getElementById('proj');
+  el.classList.remove('roll'); void el.offsetWidth;
+  const scores=p.scores?Object.entries(p.scores).map(([n,v])=>esc(n)+' '+Math.round(v*100)+'%').join(' · '):'';
+  const poster=p.poster?'<img class="pp" src="'+escAttr(p.poster)+'" alt="">'
+                       :'<div class="pp-ph" id="proj-poster-ph">'+WL_FILM+'</div>';
+  const genres=Array.isArray(p.genres)?p.genres.join(' · '):String(p.genres||'');
+  el.innerHTML=poster+
+    '<h1>'+esc(p.title)+' <span class="yr">('+esc(String(p.year||''))+')</span></h1>'+
+    (genres?'<div class="pmeta">'+esc(genres)+'</div>':'')+
+    '<div class="ptier">'+tierLine(p)+'</div>'+
+    (scores?'<div class="pscores">'+scores+(p.weakest&&Object.keys(p.scores).length>1?' · weakest fan: '+esc(p.weakest):'')+'</div>':'')+
+    (p.link?'<div class="pmeta" style="margin-top:10px"><a href="'+escAttr(p.link)+'" target="_blank" rel="noopener">Open on TMDb</a></div>':'');
+  el.classList.add('roll');
+  if(!p.poster && p.id){
+    fetch('/api/poster?id='+p.id).then(r=>r.json()).then(d=>{
+      if(d.poster){ p.poster=d.poster;
+        const ph=document.getElementById('proj-poster-ph');
+        if(ph && nightPicks[nightIdx]===p){ const img=new Image(); img.className='pp'; img.alt=''; img.src=d.poster; ph.replaceWith(img); } }
+    }).catch(()=>{});
+  }
+}
+async function nightPick(){
+  const btn=document.getElementById('night-pick'), note=document.getElementById('night-note');
+  if(nightPicks.length){
+    nightIdx=(nightIdx+1)%nightPicks.length; project(nightPicks[nightIdx]);
+    note.textContent = nightIdx===nightPicks.length-1 ? 'That was the last one — next wraps around.' : '';
+    return;
+  }
+  btn.disabled=true; note.textContent='The projector is warming up…';
+  let d=null;
+  try{ d=await (await fetch('/api/movie-night',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({party:[...nightParty], n:12})})).json(); }catch(e){}
+  btn.disabled=false;
+  if(!d||!d.ok){ note.textContent=(d&&d.error)?String(d.error):'The projector jammed — try again.'; return; }
+  nightPicks=(d.data&&d.data.picks)||[]; nightIdx=-1;
+  if(!nightPicks.length){
+    document.getElementById('proj').innerHTML='<div class="pidle">'+esc((d.data&&d.data.message)||'Nothing to pick from yet — fill those watchlists.')+'</div>';
+    note.textContent=''; return;
+  }
+  note.textContent=(d.data.filtered_by_providers?'Limited to your streaming services. ':'')+
+    ((d.data.missing&&d.data.missing.length)?('Skipped (not imported): '+d.data.missing.map(esc).join(', ')+'.'):'');
+  btn.textContent='Next pick';
+  nightIdx=0; project(nightPicks[0]);
+}
+document.getElementById('night-switch').onclick = nightToggle;
+document.getElementById('night-pick').onclick = nightPick;
+document.getElementById('night-providers').onclick = openProviders;
 
 /* ---- First-run onboarding ---- */
 let onbSeed=null, onbSteps=[], onbIdx=0, onboardingActive=false, onbSearchTimer=null;
@@ -2547,12 +2811,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"weights": load_weights()}))
         elif self.path.startswith("/api/watchlist"):
             self._send(200, json.dumps({"items": get_watchlist()}))
+        elif self.path.startswith("/api/rated"):
+            from urllib.parse import urlparse, parse_qs
+            st = parse_qs(urlparse(self.path).query).get("status", ["3"])[0]
+            st = st if st in ("3", "2", "1", "0") else "3"
+            self._send(200, json.dumps({"items": get_rated(st)}))
         elif self.path.startswith("/api/poster"):
             from urllib.parse import urlparse, parse_qs
             pid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
             self._send(200, json.dumps({"poster": fetch_poster(int(pid)) if pid.isdigit() else None}))
         elif self.path.startswith("/api/likes"):
             self._send(200, json.dumps({"likes": liked_export()}))
+        elif self.path.startswith("/api/share"):
+            self._send(200, json.dumps({"share": share_export()}))
         elif self.path.startswith("/api/friends"):
             self._send(200, json.dumps({"friends": friends_info()}))
         elif self.path.startswith("/api/providers"):
@@ -2696,6 +2967,22 @@ class Handler(BaseHTTPRequestHandler):
                 for r in data.get("recommendations", []):
                     if isinstance(r.get("id"), int):
                         seen.add(r["id"])
+            self._send(200, json.dumps({"ok": ok, "data": data} if ok else {"ok": False, "error": data}))
+
+        elif self.path.startswith("/api/movie-night"):
+            party, n = [], 8
+            try:
+                if raw:
+                    body = json.loads(raw)
+                    party = [str(x)[:60] for x in (body.get("party") or [])][:12]
+                    n = max(1, min(int(body.get("n", 8)), 20))
+            except Exception:
+                pass
+            ok, data = run_recommender(["--movie-night", "--party", json.dumps(party), "--n", str(n)])
+            if ok and isinstance(data, dict):
+                for p in data.get("picks", []):
+                    if isinstance(p.get("id"), int) and not p.get("poster"):
+                        p["poster"] = _poster_cached(p["id"]) or ""
             self._send(200, json.dumps({"ok": ok, "data": data} if ok else {"ok": False, "error": data}))
 
         elif self.path.startswith("/api/import-friend"):

@@ -24,6 +24,7 @@ ideas-for-later/
 # --- ML recommender: generated artifacts (regenerable; some derive from your data) ---
 ml-recommender/features_cache.json
 ml-recommender/model.json
+ml-recommender/providers_cache.json
 ml-recommender/recommendations.md
 ml-recommender/*.mlpackage
 
