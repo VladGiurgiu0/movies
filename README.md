@@ -71,8 +71,12 @@ dependency (NumPy).
   first, then *most*, then *any*, then a fresh pick), filtered to your streaming
   services. Every participant's taste scores every candidate — their exported
   model when available, otherwise similarity to their likes and dislikes — and
-  the group pick is decided by **least misery** (the film nobody would hate),
-  with each person's match shown on screen.
+  the group chooses **how to decide**: *Nobody suffers* (least misery, the
+  default), *Crowd pleaser* (average), or *With a floor* (average, but films
+  someone scores very low sink to the back). Each person's match and a one-line
+  **why** are shown on screen, and buddies can be added or removed right from
+  the panel. See [How movie night decides](#how-movie-night-decides-and-why)
+  for the research behind these choices.
 - **Guided first run** — on a fresh start, a short onboarding helps you paste your
   TMDb key, make your first channel (just name a film you love), and learn how
   rating works — so there's something to do from minute one.
@@ -180,6 +184,74 @@ a compact logistic-regression model once you've rated enough — and writes a
 ranked `recommendations.md`. It's NumPy-only, with a Core ML export for on-device
 use in the works; see its [README](ml-recommender/README.md) for how it works and
 why a small linear model is the right tool at this scale.
+
+## How movie night decides (and why)
+
+Movie night is a small group recommender system. Its design follows what the
+group-recommendation literature has found empirically:
+
+**Score-level aggregation (an ensemble), not a merged model.** Every
+participant's taste model scores every candidate, and a group operator combines
+those scores at decision time. Keeping per-person scores intact is what makes a
+veto expressible — least misery is a minimum over members, which no single
+merged weight vector can represent — and it is also what keeps every pick
+explainable per person [5, 6].
+
+**Rank normalization.** Model probabilities and similarity scores live on
+different scales, so each participant's scores are converted to percentile
+ranks over the shared candidate pool before combining — the standard
+rank-aggregation approach in group recommendation [7].
+
+**Three decision rules, chosen by the group.** *Nobody suffers* (least misery:
+a film's group score is its lowest fan's score), *Crowd pleaser* (the average),
+and *With a floor* (average without misery: the mean, but films below any one
+person's floor sink to the back). These are the strategies people naturally use
+when choosing for their own groups [5]. The literature finds no single best
+rule: two large user studies showed the most effective strategy depends on how
+much the group's preferences diverge [1]; the average often wins on accuracy in
+benchmarks over ephemeral groups [2] while least misery wins in other domains
+[3]; and which rule is used measurably affects how well people understand the
+recommendation [4]. *Nobody suffers* is the default because a movie night is a
+single shared experience: one person's misery costs the evening more than extra
+average enthusiasm gains it [5, 6].
+
+**Short per-person explanations.** Each projection carries one line per
+participant — the top feature contributions from their model, or the nearest
+film they liked. Explanations that reference every group member's preferences
+improve perceived fairness, consensus, and satisfaction [8], and people
+struggle to judge group picks without them [9]; at the same time, longer and
+more detailed explanations do not improve actual understanding [4], so the
+lines stay short.
+
+References:
+
+1. Barile, F., Draws, T., Inel, O., et al. (2023). Evaluating explainable social
+   choice-based aggregation strategies for group recommendation. *User Modeling
+   and User-Adapted Interaction*, 33.
+2. Ceh-Varela, E., Cao, H., & Lauw, H. W. (2022). Performance evaluation of
+   aggregation-based group recommender systems for ephemeral groups. *ACM
+   Transactions on Intelligent Systems and Technology*, 13(6).
+3. Ahmad, H. S., Nurjanah, D., & Rismala, R. (2017). A combination of individual
+   model on memory-based group recommender system to the books domain. *5th
+   International Conference on Information and Communication Technology*.
+4. Waterschoot, C., Barile, F., & Tintarev, N. (2025). With friends like these,
+   who needs explanations? Evaluating user understanding of group
+   recommendations. *Proceedings of the 33rd ACM Conference on User Modeling,
+   Adaptation and Personalization (UMAP)*.
+5. Masthoff, J. (2015). Group recommender systems: Aggregation, satisfaction and
+   group attributes. In *Recommender Systems Handbook* (2nd ed.). Springer.
+6. O'Connor, M., Cosley, D., Konstan, J. A., & Riedl, J. (2001). PolyLens: A
+   recommender system for groups of users. *Proceedings of ECSCW 2001*.
+7. Baltrunas, L., Makcinskas, T., & Ricci, F. (2010). Group recommendations with
+   rank aggregation and collaborative filtering. *Proceedings of the 4th ACM
+   Conference on Recommender Systems (RecSys)*.
+8. Tran, T. N. T., Atas, M., Felfernig, A., et al. (2019). Towards social
+   choice-based explanations in group recommender systems. *Proceedings of the
+   27th ACM Conference on User Modeling, Adaptation and Personalization (UMAP)*.
+9. Dokoupil, P., Peska, L., & Barile, F. (2025). Effects of quantitative
+   explanations on fairness perception in group recommender systems.
+   *Proceedings of the 33rd ACM Conference on User Modeling, Adaptation and
+   Personalization (UMAP)*.
 
 ## Tests
 

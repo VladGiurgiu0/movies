@@ -563,10 +563,56 @@ class TestMovieNight(unittest.TestCase):
         feats = [{"genre=Drama": 1.0}]
         good = {"schema": rec.MODEL_VERSION, "vocab": ["genre=Drama"],
                 "theta": [1.0, 0.0], "mu": [0.5], "sd": [0.5]}
-        _, how = rec._person_scores({"model": good, "likes": []}, feats, {})
+        _, how, whys = rec._person_scores({"model": good, "likes": []}, feats, {})
         self.assertEqual(how, "model")
-        _, how2 = rec._person_scores({"model": dict(good, schema="v999"), "likes": []}, feats, {})
+        self.assertEqual(len(whys), 1)
+        self.assertIn("Drama", whys[0])                # explanation names the driving feature
+        _, how2, whys2 = rec._person_scores({"model": dict(good, schema="v999"), "likes": []}, feats, {})
         self.assertEqual(how2, "none")                 # wrong schema, no likes -> neutral
+        self.assertEqual(whys2, ["no taste data yet"])
+
+    def _night(self, combine):
+        """movie_night on a fixture where average and least misery disagree:
+        candidate 20 is loved by You, hated by Anna; candidate 21 is fine for both."""
+        mv = lambda i, g: {"id": i, "title": "M%d" % i, "year": "2000", "genres": g if isinstance(g, list) else [g],
+                           "link": "", "poster": "", "overview": ""}
+        my_movies = [dict(mv(1, "Drama"), rating=3), dict(mv(5, "Comedy"), rating=3),
+                     dict(mv(2, "Horror"), rating=1)]
+        my_watch = [mv(20, ["Drama", "Drama"]), mv(21, "Comedy")]
+        friend = {"name": "Anna", "likes": [mv(3, "Comedy")], "dislikes": [mv(4, "Drama")],
+                  "watchlist": [mv(20, "Drama"), mv(21, "Comedy")], "seen": []}
+        orig = (rec.load_movies, rec.load_watchlist, rec.load_friends,
+                rec.not_interested_ids, rec.tf.get_features, rec.MODEL_PATH)
+        try:
+            rec.load_movies = lambda path=None: my_movies
+            rec.load_watchlist = lambda path=None: my_watch
+            rec.load_friends = lambda: [friend]
+            rec.not_interested_ids = lambda path=None: set()
+            rec.tf.get_features = self._features_stub
+            rec.MODEL_PATH = os.path.join(tempfile.mkdtemp(), "none.json")
+            return rec.movie_night(["Anna"], n=10, offline=True, combine=combine)
+        finally:
+            (rec.load_movies, rec.load_watchlist, rec.load_friends,
+             rec.not_interested_ids, rec.tf.get_features, rec.MODEL_PATH) = orig
+
+    def test_combine_strategies_rank_differently(self):
+        # Anna hates Drama-heavy 20: least misery must put 21 first
+        lm = self._night("least_misery")
+        self.assertEqual(lm["combine"], "least_misery")
+        self.assertEqual([p["id"] for p in lm["picks"]][0], 21)
+        for p in lm["picks"]:                          # group score = min of members
+            self.assertEqual(p["group_score"], min(p["scores"].values()))
+        # avg_no_misery floors 20 (Anna's score below the floor) -> sinks below 21
+        anm = self._night("avg_no_misery")
+        ids = [p["id"] for p in anm["picks"]]
+        self.assertLess(ids.index(21), ids.index(20))
+        p20 = next(p for p in anm["picks"] if p["id"] == 20)
+        self.assertTrue(p20.get("floored"))
+        # every pick carries one why per participant
+        for p in anm["picks"]:
+            self.assertEqual(set(p["why"].keys()), {"You", "Anna"})
+        # bad combine string falls back safely
+        self.assertEqual(self._night("nonsense")["combine"], "least_misery")
 
 
 if __name__ == "__main__":

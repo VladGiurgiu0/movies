@@ -1509,6 +1509,14 @@ PAGE = r"""<!DOCTYPE html>
   .night-panel .ghost{background:#26262b;color:#d8d4c9}
   .np-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .night-panel .note{color:#8d897f}
+  .npx{margin-left:7px;opacity:.45;font-size:13px;line-height:1;display:inline-block}
+  .npf:hover .npx{opacity:.9}
+  .npx.arm{opacity:1;color:var(--coral);font-size:11px;font-weight:600}
+  .night-panel .seg{background:#1d1d21;border-color:#34343b}
+  .night-panel .seg button{color:#cfccc2}
+  .night-panel .seg button.on{color:#fff}
+  .proj .pwhy{font-size:12px;opacity:.55;letter-spacing:-.01em;margin-top:3px}
+  .proj .pscores + .pwhy{margin-top:9px}
 </style></head>
 <body>
   <div class="page">
@@ -1577,6 +1585,15 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="night-panel">
         <div class="np-row" id="night-party"></div>
+        <div class="np-row">
+          <span class="np-lbl">How to decide:</span>
+          <div class="seg" id="night-combine">
+            <button data-c="least_misery" class="on">Nobody suffers</button>
+            <button data-c="average">Crowd pleaser</button>
+            <button data-c="avg_no_misery">With a floor</button>
+          </div>
+          <span class="tip" data-tip="How everyone's scores merge into one pick. Nobody suffers ranks films by their LOWEST fan, so no one gets a film they'd hate. Crowd pleaser ranks by the average — highest overall enthusiasm. With a floor averages too, but any film someone scores very low sinks to the back.">i</span>
+        </div>
         <div class="np-actions">
           <button class="primarybtn" id="night-pick">Start the projector</button>
           <button class="ghost" id="night-providers">Where you watch</button>
@@ -2595,10 +2612,21 @@ function renderNightParty(){
   try{ localStorage.setItem('nightParty', JSON.stringify([...nightParty])); }catch(e){}
   row.innerHTML='<span class="np-lbl">Tonight:</span><button class="npf you" tabindex="-1">You</button>'+
     friends.map(f=>'<button class="npf'+(nightParty.has(f.name)?' on':'')+'" data-n="'+escAttr(f.name)+'" title="'+
-      (f.model?'Taste model imported':'No taste model in their file — scored by similarity to their likes')+'">'+esc(f.name)+'</button>').join('')+
+      (f.model?'Taste model imported':'No taste model in their file — scored by similarity to their likes')+'">'+esc(f.name)+
+      '<span class="npx" title="Remove '+escAttr(f.name)+' and their imported file">&times;</span></button>').join('')+
     '<button class="ghost" id="night-add">Add a buddy</button>';
-  row.querySelectorAll('.npf[data-n]').forEach(b=>b.onclick=()=>{
-    const n=b.dataset.n; if(nightParty.has(n)) nightParty.delete(n); else nightParty.add(n);
+  row.querySelectorAll('.npf[data-n]').forEach(b=>b.onclick=(e)=>{
+    const n=b.dataset.n, x=b.querySelector('.npx');
+    if(e.target===x){                                    // the little x: two taps to remove
+      if(x.classList.contains('arm')){
+        removeFriend(n).then(()=>{ if(nightPicks.length) projIdle(); });
+      } else {
+        x.classList.add('arm'); x.textContent='Remove?';
+        setTimeout(()=>{ if(x.isConnected){ x.classList.remove('arm'); x.innerHTML='&times;'; } }, 2600);
+      }
+      return;
+    }
+    if(nightParty.has(n)) nightParty.delete(n); else nightParty.add(n);
     const had=nightPicks.length; renderNightParty(); if(had) projIdle();   // party changed -> picks are stale
   });
   const add=document.getElementById('night-add');
@@ -2614,6 +2642,7 @@ function project(p){
   const el=document.getElementById('proj');
   el.classList.remove('roll'); void el.offsetWidth;
   const scores=p.scores?Object.entries(p.scores).map(([n,v])=>esc(n)+' '+Math.round(v*100)+'%').join(' · '):'';
+  const whys=p.why?Object.entries(p.why).map(([n,w])=>'<div class="pwhy"><b>'+esc(n)+'</b> — '+esc(w)+'</div>').join(''):'';
   const poster=p.poster?'<img class="pp" src="'+escAttr(p.poster)+'" alt="">'
                        :'<div class="pp-ph" id="proj-poster-ph">'+WL_FILM+'</div>';
   const genres=Array.isArray(p.genres)?p.genres.join(' · '):String(p.genres||'');
@@ -2621,7 +2650,9 @@ function project(p){
     '<h1>'+esc(p.title)+' <span class="yr">('+esc(String(p.year||''))+')</span></h1>'+
     (genres?'<div class="pmeta">'+esc(genres)+'</div>':'')+
     '<div class="ptier">'+tierLine(p)+'</div>'+
-    (scores?'<div class="pscores">'+scores+(p.weakest&&Object.keys(p.scores).length>1?' · weakest fan: '+esc(p.weakest):'')+'</div>':'')+
+    (scores?'<div class="pscores">'+scores+(p.weakest&&Object.keys(p.scores).length>1?' · weakest fan: '+esc(p.weakest):'')+
+      (p.floored?' · below someone\'s floor':'')+'</div>':'')+
+    whys+
     (p.link?'<div class="pmeta" style="margin-top:10px"><a href="'+escAttr(p.link)+'" target="_blank" rel="noopener">Open on TMDb</a></div>':'');
   el.classList.add('roll');
   if(!p.poster && p.id){
@@ -2642,7 +2673,7 @@ async function nightPick(){
   btn.disabled=true; note.textContent='The projector is warming up…';
   let d=null;
   try{ d=await (await fetch('/api/movie-night',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({party:[...nightParty], n:12})})).json(); }catch(e){}
+        body:JSON.stringify({party:[...nightParty], n:12, combine:nightCombine})})).json(); }catch(e){}
   btn.disabled=false;
   if(!d||!d.ok){ note.textContent=(d&&d.error)?String(d.error):'The projector jammed — try again.'; return; }
   nightPicks=(d.data&&d.data.picks)||[]; nightIdx=-1;
@@ -2658,6 +2689,21 @@ async function nightPick(){
 document.getElementById('night-switch').onclick = nightToggle;
 document.getElementById('night-pick').onclick = nightPick;
 document.getElementById('night-providers').onclick = openProviders;
+let nightCombine='least_misery';
+try{ const c=localStorage.getItem('nightCombine');
+  if(['least_misery','average','avg_no_misery'].indexOf(c)>=0) nightCombine=c; }catch(e){}
+(function(){
+  const seg=document.getElementById('night-combine');
+  seg.querySelectorAll('button').forEach(b=>{
+    b.classList.toggle('on', b.dataset.c===nightCombine);
+    b.onclick=()=>{
+      nightCombine=b.dataset.c;
+      seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on', x===b));
+      try{ localStorage.setItem('nightCombine', nightCombine); }catch(e){}
+      if(nightPicks.length) projIdle();    // strategy changed -> re-roll under the new rule
+    };
+  });
+})();
 
 /* ---- First-run onboarding ---- */
 let onbSeed=null, onbSteps=[], onbIdx=0, onboardingActive=false, onbSearchTimer=null;
@@ -2970,15 +3016,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": ok, "data": data} if ok else {"ok": False, "error": data}))
 
         elif self.path.startswith("/api/movie-night"):
-            party, n = [], 8
+            party, n, combine = [], 8, "least_misery"
             try:
                 if raw:
                     body = json.loads(raw)
                     party = [str(x)[:60] for x in (body.get("party") or [])][:12]
                     n = max(1, min(int(body.get("n", 8)), 20))
+                    c = str(body.get("combine") or "")
+                    if c in ("least_misery", "average", "avg_no_misery"):
+                        combine = c
             except Exception:
                 pass
-            ok, data = run_recommender(["--movie-night", "--party", json.dumps(party), "--n", str(n)])
+            ok, data = run_recommender(["--movie-night", "--party", json.dumps(party),
+                                        "--n", str(n), "--combine", combine])
             if ok and isinstance(data, dict):
                 for p in data.get("picks", []):
                     if isinstance(p.get("id"), int) and not p.get("poster"):

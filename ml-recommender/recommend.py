@@ -727,22 +727,41 @@ def _rank01(scores):
 
 
 def _person_scores(person, cand_feats, metas):
-    """One participant's affinity for every candidate: their exported model when
-    its schema matches this code, else similarity to their likes/dislikes.
-    Returns (scores, how)."""
+    """One participant's affinity for every candidate, plus a short per-candidate
+    reason: their exported model when its schema matches this code (reason = the
+    top feature contributions, same machinery as the individual taste drivers),
+    else similarity to their likes/dislikes (reason = the nearest liked film).
+    Returns (scores, how, whys)."""
+    n = len(cand_feats)
     mdl = person.get("model")
     if isinstance(mdl, dict) and str(mdl.get("schema")) == MODEL_VERSION:
         try:
-            X = Vectorizer(mdl["vocab"]).transform(cand_feats)
-            return proba(mdl, X), "model"
+            vocab = mdl["vocab"]
+            X = Vectorizer(vocab).transform(cand_feats)
+            sc = proba(mdl, X)
+            Xs = (X - np.array(mdl["mu"])) / np.array(mdl["sd"])
+            theta = np.array(mdl["theta"])[:-1]
+            whys = []
+            for i in range(n):
+                pairs = [(nm, c) for nm, c in zip(vocab, Xs[i] * theta) if "=" in nm and c > 0]
+                pairs.sort(key=lambda t: -t[1])
+                whys.append(("likes " + humanize_why([nm for nm, _ in pairs[:3]]))
+                            if pairs else "nothing here their model loves")
+            return sc, "model", whys
         except Exception:
             pass
     liked = [featurize(m, metas) for m in (person.get("likes") or [])]
     disliked = [featurize(m, metas) for m in (person.get("dislikes") or [])]
     if liked:
-        sc, _ = similarity_rank(cand_feats, liked, disliked)
-        return np.asarray(sc, float), "similarity"
-    return np.zeros(len(cand_feats)), "none"
+        sc, nearest = similarity_rank(cand_feats, liked, disliked)
+        titles = [m.get("title", "") for m in (person.get("likes") or [])]
+        whys = []
+        for i in range(n):
+            t = titles[int(nearest[i])] if nearest is not None and titles else ""
+            whys.append(("similar to " + t + ", which they liked") if t
+                        else "similar to their liked films")
+        return np.asarray(sc, float), "similarity", whys
+    return np.zeros(n), "none", ["no taste data yet"] * n
 
 
 def _own_participant(movies):
@@ -797,8 +816,20 @@ def _available_ids(ids, region, providers):
     return out
 
 
-def movie_night(party, n=8, offline=False):
+# How the group combines individual scores. All three operate on the same
+# rank-normalized score matrix; they are the strategies people naturally use
+# when deciding for their own groups (Masthoff 2015), and the empirically best
+# one depends on how much the group's tastes diverge (Barile et al. 2023):
+#   least_misery  — group score = the lowest fan's score (nobody suffers)
+#   average       — the mean (crowd pleaser)
+#   avg_no_misery — the mean, but films below anyone's floor sink to the back
+COMBINE_OPS = ("least_misery", "average", "avg_no_misery")
+MISERY_FLOOR = 0.25   # avg_no_misery: a film under this percentile for anyone is floored
+
+
+def movie_night(party, n=8, offline=False, combine="least_misery"):
     """Pick films for the group: you + the named imported friends."""
+    combine = combine if combine in COMBINE_OPS else "least_misery"
     movies = load_movies()
     watchlist = load_watchlist()
     by_name = {(f.get("name") or "a friend"): f for f in load_friends()}
@@ -811,7 +842,8 @@ def movie_night(party, n=8, offline=False):
         else:
             missing.append(name)
     result = {"participants": [p["name"] for p in people], "missing": missing,
-              "picks": [], "how": {}, "filtered_by_providers": False, "message": ""}
+              "picks": [], "how": {}, "combine": combine,
+              "filtered_by_providers": False, "message": ""}
 
     # exclusions: anything anyone has seen, or you've dismissed
     seen = {m["id"] for m in movies if m["rating"] in (1, 2, 3)} | not_interested_ids()
@@ -870,13 +902,21 @@ def movie_night(party, n=8, offline=False):
     metas = tf.get_features(sorted(need), CACHE, api_key=tf.resolve_api_key(),
                             allow_network=not offline)
     cand_feats = [featurize(m, metas) for m in pool]
-    rows = []
+    rows, whys_all = [], []
     for p in people:
-        sc, how = _person_scores(p, cand_feats, metas)
+        sc, how, whys = _person_scores(p, cand_feats, metas)
         rows.append(_rank01(sc))
+        whys_all.append(whys)
         result["how"][p["name"]] = how
     P = np.vstack(rows)                     # participants x candidates
-    group = P.min(axis=0)                   # least misery
+    if combine == "average":
+        group = P.mean(axis=0)
+    elif combine == "avg_no_misery":
+        group = P.mean(axis=0)
+        floored = P.min(axis=0) < MISERY_FLOOR
+        group = np.where(floored, group - 1.0, group)   # sink, never vanish
+    else:
+        group = P.min(axis=0)               # least misery
     weakest = P.argmin(axis=0)
 
     order = sorted(range(len(pool)), key=lambda i: (tier_of[pool[i]["id"]], -group[i]))
@@ -886,7 +926,10 @@ def movie_night(party, n=8, offline=False):
         m.update({"tier": tier_of[mid], "on": sorted(onlists.get(mid, ())),
                   "group_score": round(float(group[i]), 3),
                   "scores": {p["name"]: round(float(P[j, i]), 3) for j, p in enumerate(people)},
+                  "why": {p["name"]: whys_all[j][i] for j, p in enumerate(people)},
                   "weakest": people[int(weakest[i])]["name"]})
+        if combine == "avg_no_misery" and bool(P[:, i].min() < MISERY_FLOOR):
+            m["floored"] = True
         result["picks"].append(m)
     return result
 
@@ -931,6 +974,8 @@ def main():
     ap.add_argument("--json", action="store_true", help="emit JSON to stdout (for the rater UI)")
     ap.add_argument("--movie-night", action="store_true", help="pick films for a group (you + --party)")
     ap.add_argument("--party", default="[]", help='JSON list of imported friend names joining movie night')
+    ap.add_argument("--combine", default="least_misery", choices=list(COMBINE_OPS),
+                    help="how the group combines individual scores")
     args = ap.parse_args()
     if args.rebuild_cache:
         try:
@@ -943,7 +988,7 @@ def main():
             party = [str(x) for x in json.loads(args.party or "[]")]
         except Exception:
             party = []
-        result = movie_night(party, n=args.n, offline=args.offline)
+        result = movie_night(party, n=args.n, offline=args.offline, combine=args.combine)
         print(json.dumps(result) if args.json else json.dumps(result, indent=2))
         return
     excl = {int(x) for x in args.exclude.split(",") if x.strip().isdigit()}
