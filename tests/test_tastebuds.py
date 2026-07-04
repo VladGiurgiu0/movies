@@ -489,6 +489,36 @@ class TestCleanFriend(unittest.TestCase):
             self.assertNotIn("model", tb._clean_friend(bad), breakit)
 
 
+class TestShortlistReshow(unittest.TestCase):
+    """The Channels toggle: 0-shortlist films can re-enter the rater, and
+    re-rating them replaces the old row instead of duplicating it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.md = os.path.join(self.tmp, "movies.md")
+        with open(self.md, "w", encoding="utf-8") as f:
+            f.write(MOVIES_MD)
+        self._orig = tb.MD_PATH
+        tb.MD_PATH = self.md
+
+    def tearDown(self):
+        tb.MD_PATH = self._orig
+
+    def test_seen_rated_ids_leaves_shortlist_out(self):
+        self.assertEqual(tb.rated_ids(), {111, 222, 333, 444})
+        self.assertEqual(tb.seen_rated_ids(), {111, 222, 333})   # 444 is Not seen (0)
+
+    def test_record_rating_replaces_not_duplicates(self):
+        movie = {"id": 444, "title": "On The List", "year": "2004",
+                 "genres": "Drama", "link": "http://x/444"}
+        tb.record_rating(movie, "3")                             # watched it, loved it
+        rows = [l for l in tb._table_lines(self.md) if "| 444 |" in l]
+        self.assertEqual(len(rows), 1)                           # replaced, not duplicated
+        self.assertTrue(rows[0].strip().startswith("| 3 |"))
+        self.assertEqual(tb.stats()["0"], 0)
+        self.assertEqual(tb.stats()["3"], 2)
+
+
 class TestRatedView(unittest.TestCase):
     """The Liked/Disliked sheets read movies.md by status, cache-only."""
 

@@ -470,6 +470,24 @@ def rated_ids():
     return _ids_in(MD_PATH, MD_ID_COL)
 
 
+def seen_rated_ids():
+    """Only films actually watched (rating 1/2/3) — leaves the 0-shortlist out,
+    so it can re-enter the rater when the Channels toggle asks for it."""
+    ids = set()
+    for line in _table_lines(MD_PATH):
+        c = [x.strip() for x in line.strip().strip("|").split("|")]
+        if len(c) > MD_ID_COL and c[MD_ID_COL].isdigit() and c[0] in ("1", "2", "3"):
+            ids.add(int(c[MD_ID_COL]))
+    return ids
+
+
+def record_rating(movie, rating):
+    """Rate a film, replacing any earlier movies.md row for it (a re-shown
+    shortlist film must move to its new status, not duplicate)."""
+    remove_row_by_id(MD_PATH, MD_ID_COL, int(movie["id"]))
+    append_rating(movie, rating)
+
+
 def watchlist_ids():
     return _ids_in(WATCHLIST_PATH, WATCH_ID_COL)
 
@@ -914,14 +932,21 @@ _buf_lock = threading.Lock()
 _rec_seen = {}   # profile -> set of recommendation ids already shown this session (kept fresh)
 
 
-def next_candidate():
-    global _last_shown
+_shortlist_flag = False   # last include-shortlist mode; flipping it flushes the buffer
+
+
+def next_candidate(include_shortlist=False):
+    global _last_shown, _shortlist_flag
     with _buf_lock:
+        if include_shortlist != _shortlist_flag:   # mode changed -> drop stale buffer
+            _buffer.clear()
+            _shortlist_flag = include_shortlist
         chans = [c for c in load_channels() if c.get("enabled", True)]
         if not chans:
             return {"error": "nochannels"}
         with _io_lock:
-            already = rated_ids() | watchlist_ids() | not_interested_ids() | _shown_session
+            already = ((seen_rated_ids() if include_shortlist else rated_ids())
+                       | watchlist_ids() | not_interested_ids() | _shown_session)
         attempts = 0
         while not _buffer and attempts < 14:
             attempts += 1
@@ -1278,6 +1303,10 @@ PAGE = r"""<!DOCTYPE html>
   .ch .iconbtn:hover{color:var(--txt);background:var(--gray-tint)}
   .ch .iconbtn svg{width:16px;height:16px}
   .addlabel{font-size:12.5px;color:var(--muted);margin:16px 0 8px;letter-spacing:-.01em}
+  .shortlist-row{display:flex;gap:9px;align-items:flex-start;margin:16px 2px 2px;cursor:pointer;
+                 font-size:12.5px;color:var(--muted);letter-spacing:-.01em;line-height:1.55}
+  .shortlist-row input{margin-top:2px;accent-color:var(--blue);flex:0 0 auto}
+  .shortlist-row b{color:var(--txt);font-weight:600}
   .acard{border:1px solid var(--line);border-radius:14px;margin-bottom:10px;overflow:hidden}
   .acard .ahead{display:flex;align-items:center;gap:9px;padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600;letter-spacing:-.01em;user-select:none}
   .acard .ahead svg.tic{width:18px;height:18px;color:var(--muted);flex:0 0 auto}
@@ -1328,6 +1357,15 @@ PAGE = r"""<!DOCTYPE html>
        border-radius:9px;width:230px;max-width:62vw;opacity:0;pointer-events:none;transition:opacity .12s ease;
        z-index:60;box-shadow:0 10px 28px rgba(0,0,0,.35);text-align:left;letter-spacing:-.01em}
   .tip:hover::after,.tip.show::after{opacity:1}
+  /* verdict-button tooltips: same look, but only after a deliberate hover pause */
+  .vtip{position:relative}
+  .vtip::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);
+       background:var(--txt);color:var(--bg);font-size:11.5px;font-weight:500;line-height:1.45;padding:8px 10px;
+       border-radius:9px;width:230px;max-width:62vw;opacity:0;pointer-events:none;
+       transition:opacity .15s ease;z-index:60;box-shadow:0 10px 28px rgba(0,0,0,.35);
+       text-align:left;letter-spacing:-.01em;white-space:normal}
+  .vtip:hover::after{opacity:1;transition-delay:.6s}
+  .vtip:active::after{opacity:0;transition-delay:0s}
 
   /* Flip card: rater on the front, recommender on the back */
   .flip-wrap{position:relative;perspective:2200px;min-height:560px;transition:height .45s cubic-bezier(.4,0,.2,1)}
@@ -1652,6 +1690,10 @@ PAGE = r"""<!DOCTYPE html>
           </div>
         </div>
 
+      <label class="shortlist-row"><input type="checkbox" id="show-shortlist">
+        <span>Also re-show films marked <b>Not seen</b> — your 0-shortlist re-enters the
+        cards here, so you can re-decide (rate, watchlist) without duplicates.</span></label>
+
       </div>
       <div class="prow">
         <button class="pbtn cancel" id="ch-cancel">Cancel</button>
@@ -1869,19 +1911,35 @@ function render(d){
      '</div>'+
    '</div>'+
    '<div class="rate-row">'+
-     '<button class="btn like"    onclick="rate(3)">Liked</button>'+
-     '<button class="btn meh"     onclick="rate(2)">Indifferent</button>'+
-     '<button class="btn dislike" onclick="rate(1)">Disliked</button>'+
+     '<button class="btn like vtip"'+vt('like')+'    onclick="rate(3)">Liked</button>'+
+     '<button class="btn meh vtip"'+vt('meh')+'     onclick="rate(2)">Indifferent</button>'+
+     '<button class="btn dislike vtip"'+vt('dis')+' onclick="rate(1)">Disliked</button>'+
    '</div>'+
    '<div class="second-row">'+
-     '<button class="btn skip"  onclick="rate(0)">Not seen</button>'+
-     '<button class="btn watch" onclick="watch()">Add to Watchlist</button>'+
+     '<button class="btn skip vtip"'+vt('skip')+'  onclick="rate(0)">Not seen</button>'+
+     '<button class="btn watch vtip"'+vt('watch')+' onclick="watch()">Add to Watchlist</button>'+
    '</div>';
 }
 
+/* Verdict tooltips — the single source of truth for what each button does with
+   the user's data. IF A VERDICT'S BEHAVIOR EVER CHANGES, update in the same
+   commit: (1) these texts, (2) the README (Features list + Files table +
+   movie-night section), (3) the movies.md legend template near the top of this
+   file. Shown only after a deliberate ~0.6s hover (.vtip). */
+const TIP={
+ like:'Saves to movies.md as Liked (3). Trains your model toward films like this.',
+ meh:'Saves to movies.md as Indifferent (2). A mild push away for your model - strength adjustable in the Model panel.',
+ dis:'Saves to movies.md as Disliked (1). Pushes your model away from films like this.',
+ skip:'Saves to movies.md as Not seen (0) - your shortlist of films to maybe watch. Not used for training. By default it will not be shown here again; re-enable in Channels.',
+ watch:'Saves to watchlist.md. Not used for training. Open it from the Watchlist count above the card; it also feeds Movie night.',
+ ni:'Saves to not-interested.md. Never shown again, and gently trains your model away - strength adjustable in the Model panel.'
+};
+function vt(k){ return ' data-tip="'+TIP[k]+'"'; }
+
+function showShortlist(){ try{ return localStorage.getItem('showShortlist')==='1'; }catch(e){ return false; } }
 async function loadNext(){
   busy=true;
-  const r = await fetch('/api/next'); const d = await r.json();
+  const r = await fetch('/api/next'+(showShortlist()?'?shortlist=1':'')); const d = await r.json();
   render(d); busy=false;
 }
 async function rate(v){
@@ -2069,6 +2127,9 @@ function inlineRename(i){
 }
 
 async function openSettings(){
+  const sl=document.getElementById('show-shortlist');
+  sl.checked = showShortlist();
+  sl.onchange = ()=>{ try{ localStorage.setItem('showShortlist', sl.checked?'1':'0'); }catch(e){} loadNext(); };
   const r=await fetch('/api/channels'); const d=await r.json();
   chDraft=JSON.parse(JSON.stringify(d.channels||[]));
   genreList=d.genres||[];
@@ -2211,13 +2272,13 @@ function renderRecMovie(m){
      '</div>'+
    '</div>'+
    '<div class="rate-row">'+
-     '<button class="btn like"    onclick="recRate(3)">Liked</button>'+
-     '<button class="btn meh"     onclick="recRate(2)">Indifferent</button>'+
-     '<button class="btn dislike" onclick="recRate(1)">Disliked</button>'+
+     '<button class="btn like vtip"'+vt('like')+'    onclick="recRate(3)">Liked</button>'+
+     '<button class="btn meh vtip"'+vt('meh')+'     onclick="recRate(2)">Indifferent</button>'+
+     '<button class="btn dislike vtip"'+vt('dis')+' onclick="recRate(1)">Disliked</button>'+
    '</div>'+
    '<div class="second-row">'+
-     '<button class="btn skip"  onclick="recNotInterested()">Not interested</button>'+
-     '<button class="btn watch" onclick="recWatch()">Add to Watchlist</button>'+
+     '<button class="btn skip vtip"'+vt('ni')+'  onclick="recNotInterested()">Not interested</button>'+
+     '<button class="btn watch vtip"'+vt('watch')+' onclick="recWatch()">Add to Watchlist</button>'+
    '</div>';
 }
 async function advanceRec(){
@@ -2823,7 +2884,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, json.dumps({"error": "forbidden"}))
             return
         if self.path.startswith("/api/next"):
-            m = next_candidate()
+            from urllib.parse import urlparse, parse_qs
+            sl = parse_qs(urlparse(self.path).query).get("shortlist", ["0"])[0] == "1"
+            m = next_candidate(include_shortlist=sl)
             if isinstance(m, dict) and m.get("error"):
                 payload = {"error": m["error"], "stats": stats()}
             else:
@@ -2896,7 +2959,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = json.loads(raw.decode("utf-8"))
                 with _io_lock:
-                    append_rating(body["movie"], body["rating"])
+                    record_rating(body["movie"], body["rating"])
                     if body.get("stack", True):   # recommender manages its own undo
                         _action_stack.append({"type": "rate", "movie": body["movie"]})
             except Exception as e:
@@ -2908,6 +2971,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = json.loads(raw.decode("utf-8"))
                 with _io_lock:
+                    # a re-shown shortlist film moves to the watchlist, never duplicates
+                    remove_row_by_id(MD_PATH, MD_ID_COL, int(body["movie"]["id"]))
                     append_watchlist(body["movie"])
                     if body.get("stack", True):   # recommender manages its own undo
                         _action_stack.append({"type": "watch", "movie": body["movie"]})

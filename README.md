@@ -30,6 +30,10 @@ dependency (NumPy).
 - **Four verdicts** on an ordinal scale plus a separate watchlist:
   - `3` Liked · `2` Indifferent · `1` Disliked · `0` Not seen
   - **Add to Watchlist** for "want to watch later"
+  - Films marked **Not seen** sit out by default; a toggle at the bottom of
+    **Channels** re-shows them so you can re-decide — re-rating replaces the old
+    entry, never duplicates it. Hover any verdict button for a moment to see
+    exactly which file it writes to and how it trains your model.
 - **Your lists, one tap away** — the stats line sits above the card, visible on
   both faces. Click the **Watchlist** count to slide up a sheet of everything
   you've saved, each with its poster; mark one **watched** (it moves into your
