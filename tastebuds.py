@@ -1873,7 +1873,7 @@ function tip(t){ return '<span class="tip" data-tip="'+t+'">i</span>'; }
 const MODE_TIP='Trained model = learned from your ratings: a linear model, or a factorization machine (which adds feature-pair interactions) once it clearly beats the linear model in cross-validation. Similarity = cold-start ranking by closeness to films you liked. The model switch above overrides the automatic choice everywhere — recommendations and Movie night.';
 const AUC_TIP='ROC-AUC: the chance the model ranks a film you would like above one you would not. 0.5 is a coin flip, 1.0 is perfect.';
 const AP_TIP='Average precision: how well the very top-scored films are ones you would actually like. Rewards putting good picks first.';
-const DRV_TIP='The features that most push a film up (toward like) or down, learned from your ratings.';
+const DRV_TIP='The features that most push a film up (toward like) or down, learned from your ratings. Scale features like "longer films" or "more popular films" read as "the more of it, the stronger the push". Entries with a small x (e.g. "English-language × Animation") are feature-pair interactions the factorization machine learned — corrections to the averages, like "English films, but animated: different story".';
 const SCORE_TIP='How well this film matches your taste. With a trained model it is your estimated chance of liking it; otherwise it is a relative match within this batch.';
 
 function setTally(s){

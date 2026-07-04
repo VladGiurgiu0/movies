@@ -615,6 +615,17 @@ def humanize_why(tokens):
     return ", ".join(humanize_feature(t) for t in tokens)
 
 
+# Scale (continuous) features read as "per unit increase" — a negative weight on
+# runtime means "the LONGER, the less you like it". Give them direction-aware
+# names so the taste drivers panel says what the weight actually measures.
+_SCALE_DRIVER = {"runtime": "longer films", "year": "newer films",
+                 "vote_avg": "higher TMDb rating", "log_pop": "more popular films"}
+
+
+def humanize_driver(tok):
+    return _SCALE_DRIVER.get(tok, humanize_feature(tok))
+
+
 def _atomic_write(path, text):
     """Write atomically: temp file in the same dir, then os.replace()."""
     d = os.path.dirname(path) or "."
@@ -758,7 +769,7 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
 
         theta = linear_weights(model)
         result["model_kind"] = model_kind(model)
-        result["drivers"] = [[nm, round(float(c), 3)] for nm, c in
+        result["drivers"] = [[humanize_driver(nm), round(float(c), 3)] for nm, c in
                              sorted(zip(vocab, theta), key=lambda t: -abs(t[1]))[:8]]
         result["drivers"] += top_interactions(model, vocab)   # FM only; 'A × B' pairs
         cv_auc = result["cv"]["auc"] if result["cv"] else None
