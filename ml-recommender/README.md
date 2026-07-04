@@ -25,7 +25,8 @@ exportable to Core ML for on-device inference.
 2. **Featurize** each film from TMDb metadata (cached locally after first fetch):
    genres, keywords, director, top cast, original language, decade, runtime,
    TMDb rating, popularity.
-3. **Model** — chosen automatically by how much data you have:
+3. **Model** — chosen automatically by how much data you have, and by
+   cross-validation:
    - **Cold start (< 8 likes):** rank candidates by **content similarity** to your
      liked set, minus similarity to your disliked set.
    - **Trained (≥ 8 likes & ≥ 5 not-liked):** a **logistic-regression** model
@@ -34,6 +35,22 @@ exportable to Core ML for on-device inference.
      push toward "like"). If the model isn't beating chance in CV (common until
      you've rated enough films you *didn't* love), recommendations fall back to
      similarity ranking automatically.
+   - **Factorization machine (gated):** every training run also cross-validates a
+     **factorization machine** (Rendle, ICDM 2010) — the same linear model plus
+     factorized pairwise feature interactions, z = b + w·x + Σ ⟨vᵢ,vⱼ⟩ xᵢxⱼ, so
+     it can learn combinations like *"English-language × Animation"* that no
+     linear model can represent. It takes over **only when it beats the linear
+     model's CV ROC-AUC by more than 0.015**; otherwise the linear model stays.
+     The Model panel shows both scores and which one is active, and the top
+     learned interaction pairs join the taste drivers. When the FM is active, a
+     linear twin is stored alongside it — that is what the Share export sends,
+     so friends' importers keep working unchanged. (Implementation note: the
+     interaction term is trained on raw, unstandardized features — standardizing
+     one-hot columns inflates rare features and destabilizes the pairwise term.)
+   - **Your call, always:** the Model panel's **model switch** (Auto /
+     Similarity / Linear / FM; `--model` on the CLI) overrides the automatic
+     choice everywhere — recommendations and Movie night. Both trained kinds are
+     cached side by side, so switching never retrains.
 4. **Recommend** — writes the ranked top-N to `recommendations.md`, each with a
    short *why* (top contributing features, or the nearest liked film).
 

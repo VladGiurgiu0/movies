@@ -722,13 +722,17 @@ def _portable_model():
     try:
         with open(path, "r", encoding="utf-8") as f:
             m = json.load(f)
-        vocab, theta, mu, sd = m.get("vocab"), m.get("theta"), m.get("mu"), m.get("sd")
+        vocab = m.get("vocab")
+        # when a factorization machine is active locally, its linear twin travels
+        # instead — friends' importers validate (and score) the linear shape
+        src = m.get("linear") if (m.get("kind") == "fm" and isinstance(m.get("linear"), dict)) else m
+        theta, mu, sd = src.get("theta"), src.get("mu"), src.get("sd")
         if not (isinstance(vocab, list) and isinstance(theta, list) and len(theta) == len(vocab) + 1):
             return None
         if not all(isinstance(v, list) and len(v) == len(vocab) for v in (mu, sd)):
             return None
         return {"schema": str(m.get("version", "v1")), "vocab": vocab, "theta": theta,
-                "mu": mu, "sd": sd, "cv": m.get("cv")}
+                "mu": mu, "sd": sd, "cv": src.get("cv") or m.get("cv")}
     except Exception:
         return None
 
@@ -1165,7 +1169,7 @@ PAGE = r"""<!DOCTYPE html>
   .win-sub{font-size:12px;color:var(--muted);letter-spacing:-.01em}
   .srcchip{display:inline-block;background:rgba(18,143,134,.12);color:var(--teal);font-size:11.5px;font-weight:600;
            padding:3px 10px;border-radius:980px;margin-bottom:10px;letter-spacing:-.01em}
-  .cardfoot{display:flex;justify-content:flex-end;margin-top:12px}
+  .cardfoot{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
   #rec-body{min-height:542px}
   .loading{min-height:542px;display:flex;flex-direction:column;align-items:center;justify-content:center;
            color:var(--muted);font-size:14px;letter-spacing:-.01em;text-align:center}
@@ -1357,15 +1361,8 @@ PAGE = r"""<!DOCTYPE html>
        border-radius:9px;width:230px;max-width:62vw;opacity:0;pointer-events:none;transition:opacity .12s ease;
        z-index:60;box-shadow:0 10px 28px rgba(0,0,0,.35);text-align:left;letter-spacing:-.01em}
   .tip:hover::after,.tip.show::after{opacity:1}
-  /* verdict-button tooltips: same look, but only after a deliberate hover pause */
-  .vtip{position:relative}
-  .vtip::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);
-       background:var(--txt);color:var(--bg);font-size:11.5px;font-weight:500;line-height:1.45;padding:8px 10px;
-       border-radius:9px;width:230px;max-width:62vw;opacity:0;pointer-events:none;
-       transition:opacity .15s ease;z-index:60;box-shadow:0 10px 28px rgba(0,0,0,.35);
-       text-align:left;letter-spacing:-.01em;white-space:normal}
-  .vtip:hover::after{opacity:1;transition-delay:.6s}
-  .vtip:active::after{opacity:0;transition-delay:0s}
+  .tip::after{white-space:pre-line}
+  .tip.edge::after{left:0;transform:none;width:300px}
 
   /* Flip card: rater on the front, recommender on the back */
   .flip-wrap{position:relative;perspective:2200px;min-height:560px;transition:height .45s cubic-bezier(.4,0,.2,1)}
@@ -1490,6 +1487,8 @@ PAGE = r"""<!DOCTYPE html>
   .wrow input[type=range]{flex:1;accent-color:var(--violet)}
   .wrow .wv{width:40px;text-align:right;font-size:13px;font-weight:600}
   .mwarn{font-size:12px;color:var(--coral);margin-top:8px;min-height:14px;letter-spacing:-.01em}
+  .mseg{display:flex;width:100%}
+  .mseg button{flex:1}
   .primarybtn:disabled{opacity:.45;cursor:default}
 
   /* Movie night: the lights go down and a projector takes the card's place */
@@ -1579,7 +1578,7 @@ PAGE = r"""<!DOCTYPE html>
           <button class="flipbtn" id="to-rec">Get recommendations<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5l7 7-7 7"/><path d="M20 12H4"/></svg></button>
         </div>
         <div id="card"><div class="msg">Loading.</div></div>
-        <div class="cardfoot"><button class="undo" id="undo"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-2"/></svg>Undo last action</button></div>
+        <div class="cardfoot"><span class="tip edge" id="verdict-tip-rate">i</span><button class="undo" id="undo"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-2"/></svg>Undo last action</button></div>
       </div>
       </div>
 
@@ -1606,7 +1605,7 @@ PAGE = r"""<!DOCTYPE html>
           <span class="win-sub" id="rec-meta"></span>
         </div>
         <div id="rec-body"></div>
-        <div class="cardfoot"><button class="undo" id="rec-undo"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-2"/></svg>Undo last action</button></div>
+        <div class="cardfoot"><span class="tip edge" id="verdict-tip-rec">i</span><button class="undo" id="rec-undo"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-2"/></svg>Undo last action</button></div>
         <div class="rec-foot"><button class="refresh-btn" id="do-recs"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg>Next recommendation</button></div>
       </div>
       </div>
@@ -1734,12 +1733,25 @@ PAGE = r"""<!DOCTYPE html>
 
       <div class="mflow">&#8595;</div>
 
-      <div class="mstage">3 &middot; Train</div>
+      <div class="mstage">3 &middot; Which model ranks your films</div>
+      <div class="seg mseg" id="model-pref">
+        <button data-p="auto" class="on">Auto</button>
+        <button data-p="similarity">Similarity</button>
+        <button data-p="linear">Linear</button>
+        <button data-p="fm">FM</button>
+      </div>
+      <div class="mnote">Auto lets cross-validation decide: the factorization machine (which adds
+        feature-pair interactions) takes over only when it clearly beats the linear model.
+        Pick one to override — your data, your model, your call.</div>
+
+      <div class="mflow">&#8595;</div>
+
+      <div class="mstage">4 &middot; Train</div>
       <button class="primarybtn" id="do-train" style="width:100%">Train model</button>
 
       <div class="mflow">&#8595;</div>
 
-      <div class="mstage">4 &middot; Results</div>
+      <div class="mstage">5 &middot; Results</div>
       <div id="train-out"><div class="ml-msg">Press <b>Train</b> to see your model's quality and what drives it.</div></div>
     </div>
   </div>
@@ -1858,7 +1870,7 @@ let addStyle = "popular";
 function esc(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
 function escAttr(s){ return String(s==null?'':s).replace(/"/g,'%22'); }
 function tip(t){ return '<span class="tip" data-tip="'+t+'">i</span>'; }
-const MODE_TIP='Trained model = learned from your ratings. Similarity = cold-start ranking by closeness to films you liked, used until you have enough ratings.';
+const MODE_TIP='Trained model = learned from your ratings: a linear model, or a factorization machine (which adds feature-pair interactions) once it clearly beats the linear model in cross-validation. Similarity = cold-start ranking by closeness to films you liked. The model switch above overrides the automatic choice everywhere — recommendations and Movie night.';
 const AUC_TIP='ROC-AUC: the chance the model ranks a film you would like above one you would not. 0.5 is a coin flip, 1.0 is perfect.';
 const AP_TIP='Average precision: how well the very top-scored films are ones you would actually like. Rewards putting good picks first.';
 const DRV_TIP='The features that most push a film up (toward like) or down, learned from your ratings.';
@@ -1911,30 +1923,33 @@ function render(d){
      '</div>'+
    '</div>'+
    '<div class="rate-row">'+
-     '<button class="btn like vtip"'+vt('like')+'    onclick="rate(3)">Liked</button>'+
-     '<button class="btn meh vtip"'+vt('meh')+'     onclick="rate(2)">Indifferent</button>'+
-     '<button class="btn dislike vtip"'+vt('dis')+' onclick="rate(1)">Disliked</button>'+
+     '<button class="btn like"    onclick="rate(3)">Liked</button>'+
+     '<button class="btn meh"     onclick="rate(2)">Indifferent</button>'+
+     '<button class="btn dislike" onclick="rate(1)">Disliked</button>'+
    '</div>'+
    '<div class="second-row">'+
-     '<button class="btn skip vtip"'+vt('skip')+'  onclick="rate(0)">Not seen</button>'+
-     '<button class="btn watch vtip"'+vt('watch')+' onclick="watch()">Add to Watchlist</button>'+
+     '<button class="btn skip"  onclick="rate(0)">Not seen</button>'+
+     '<button class="btn watch" onclick="watch()">Add to Watchlist</button>'+
    '</div>';
 }
 
 /* Verdict tooltips — the single source of truth for what each button does with
-   the user's data. IF A VERDICT'S BEHAVIOR EVER CHANGES, update in the same
-   commit: (1) these texts, (2) the README (Features list + Files table +
-   movie-night section), (3) the movies.md legend template near the top of this
-   file. Shown only after a deliberate ~0.6s hover (.vtip). */
+   the user's data, shown via the single "i" in each window's footer.
+   IF A VERDICT'S BEHAVIOR EVER CHANGES, update in the same commit:
+   (1) these texts, (2) the README (Features list + Files table + movie-night
+   section), (3) the movies.md legend template near the top of this file. */
 const TIP={
- like:'Saves to movies.md as Liked (3). Trains your model toward films like this.',
- meh:'Saves to movies.md as Indifferent (2). A mild push away for your model - strength adjustable in the Model panel.',
- dis:'Saves to movies.md as Disliked (1). Pushes your model away from films like this.',
- skip:'Saves to movies.md as Not seen (0) - your shortlist of films to maybe watch. Not used for training. By default it will not be shown here again; re-enable in Channels.',
- watch:'Saves to watchlist.md. Not used for training. Open it from the Watchlist count above the card; it also feeds Movie night.',
- ni:'Saves to not-interested.md. Never shown again, and gently trains your model away - strength adjustable in the Model panel.'
+ like:'Liked - saves to movies.md as 3. Trains your model toward films like this.',
+ meh:'Indifferent - saves to movies.md as 2. A mild push away for your model (strength adjustable in the Model panel).',
+ dis:'Disliked - saves to movies.md as 1. Pushes your model away from films like this.',
+ skip:'Not seen - saves to movies.md as 0, your shortlist of films to maybe watch. Not used for training. By default it is not shown here again; re-enable in Channels.',
+ watch:'Add to Watchlist - saves to watchlist.md. Not used for training. Open it from the Watchlist count above the card; it also feeds Movie night.',
+ ni:'Not interested - saves to not-interested.md. Never shown again, and gently trains your model away (strength adjustable in the Model panel).'
 };
-function vt(k){ return ' data-tip="'+TIP[k]+'"'; }
+document.getElementById('verdict-tip-rate').setAttribute('data-tip',
+  'What each button does with your data:\n\n'+[TIP.like,TIP.meh,TIP.dis,TIP.skip,TIP.watch].join('\n\n'));
+document.getElementById('verdict-tip-rec').setAttribute('data-tip',
+  'What each button does with your data:\n\n'+[TIP.like,TIP.meh,TIP.dis,TIP.ni,TIP.watch].join('\n\n'));
 
 function showShortlist(){ try{ return localStorage.getItem('showShortlist')==='1'; }catch(e){ return false; } }
 async function loadNext(){
@@ -2215,15 +2230,42 @@ for(const k in W_IDS){
 }
 document.getElementById('w-reset').onclick = ()=>{ modelWeights=Object.assign({}, W_DEFAULTS); renderWeightSliders(); };
 document.getElementById('do-train').onclick = ()=> runTrain('/api/train');
+let modelPref='auto';
+try{ const c=localStorage.getItem('modelPref');
+  if(['auto','similarity','linear','fm'].indexOf(c)>=0) modelPref=c; }catch(e){}
+(function(){
+  const seg=document.getElementById('model-pref');
+  seg.querySelectorAll('button').forEach(b=>{
+    b.classList.toggle('on', b.dataset.p===modelPref);
+    b.onclick=()=>{
+      modelPref=b.dataset.p;
+      seg.querySelectorAll('button').forEach(x=>x.classList.toggle('on', x===b));
+      try{ localStorage.setItem('modelPref', modelPref); }catch(e){}
+      recDirty=true;                     // next batch ranks with the chosen model
+    };
+  });
+})();
 async function runTrain(url){
   const out = document.getElementById('train-out');
   out.innerHTML = '<div class="ml-msg">Saving your weights and training… the first run can fetch some TMDb metadata.</div>';
   try{ await fetch('/api/weights',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weights:modelWeights})}); }catch(e){}
-  let d; try { d = await (await fetch(url,{method:'POST'})).json(); }
+  let d; try { d = await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({model:modelPref})})).json(); }
   catch(e){ out.innerHTML = '<div class="ml-msg">Request failed.</div>'; return; }
   if(!d.ok){ out.innerHTML = '<div class="ml-msg">'+esc(d.error||'Failed.')+'</div>'; return; }
   const r = d.data; let h='';
-  h += '<div class="stat">Mode: <b>'+esc(r.mode)+'</b>'+tip(MODE_TIP)+' &middot; '+r.n_pos+' toward / '+r.n_neg+' away</div>';
+  let kind = r.model_kind==='fm' ? 'model (factorization machine)' : (r.mode==='model' ? 'model (linear)' : r.mode);
+  if(r.model_pref && r.model_pref!=='auto'){
+    kind += ' — your choice';
+    if(r.model_kind_auto && r.model_kind_auto!==r.model_kind) kind += ' (auto would pick '+(r.model_kind_auto==='fm'?'FM':'linear')+')';
+  }
+  h += '<div class="stat">Mode: <b>'+esc(kind)+'</b>'+tip(MODE_TIP)+' &middot; '+r.n_pos+' toward / '+r.n_neg+' away</div>';
+  if(r.cv_linear && r.cv_fm){
+    const auto = r.model_kind_auto || r.model_kind;
+    h += '<div class="stat" style="font-size:12px;color:var(--muted)">Gate: linear '+r.cv_linear.auc.toFixed(3)+
+         ' vs FM '+r.cv_fm.auc.toFixed(3)+' — '+(auto==='fm'?'FM wins the gate':'linear holds the gate (FM must win by 0.015)')+
+         ((r.model_pref && r.model_pref!=='auto')?' · overridden by you':'')+'</div>';
+  }
   if(r.cv){
     const auc=r.cv.auc; let delta='';
     if(lastAuc!=null){ const dl=auc-lastAuc; const up=dl>=0;
@@ -2249,9 +2291,9 @@ async function runTrain(url){
 let recBatch = [], recIdx = -1, recCurrent = null, recDirty = true, recBusy = false, recMeta = {}, recProfile = "you";
 function exploreVal(){ const b=document.querySelector('#explore-seg button.on'); return b ? parseFloat(b.dataset.x) : 0.45; }
 async function fetchRecBatch(){
-  const d = await (await fetch('/api/recommend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({n:18, explore:exploreVal(), profile:recProfile})})).json();
+  const d = await (await fetch('/api/recommend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({n:18, explore:exploreVal(), profile:recProfile, model:modelPref})})).json();
   if(!d.ok) throw new Error(d.error||'Failed.');
-  recMeta = {mode:d.data.mode, source:d.data.candidate_source, message:d.data.message};
+  recMeta = {mode:d.data.mode + (d.data.model_kind==='fm' ? ' (FM)' : ''), source:d.data.candidate_source, message:d.data.message};
   return d.data.recommendations || [];
 }
 function renderRecMovie(m){
@@ -2272,13 +2314,13 @@ function renderRecMovie(m){
      '</div>'+
    '</div>'+
    '<div class="rate-row">'+
-     '<button class="btn like vtip"'+vt('like')+'    onclick="recRate(3)">Liked</button>'+
-     '<button class="btn meh vtip"'+vt('meh')+'     onclick="recRate(2)">Indifferent</button>'+
-     '<button class="btn dislike vtip"'+vt('dis')+' onclick="recRate(1)">Disliked</button>'+
+     '<button class="btn like"    onclick="recRate(3)">Liked</button>'+
+     '<button class="btn meh"     onclick="recRate(2)">Indifferent</button>'+
+     '<button class="btn dislike" onclick="recRate(1)">Disliked</button>'+
    '</div>'+
    '<div class="second-row">'+
-     '<button class="btn skip vtip"'+vt('ni')+'  onclick="recNotInterested()">Not interested</button>'+
-     '<button class="btn watch vtip"'+vt('watch')+' onclick="recWatch()">Add to Watchlist</button>'+
+     '<button class="btn skip"  onclick="recNotInterested()">Not interested</button>'+
+     '<button class="btn watch" onclick="recWatch()">Add to Watchlist</button>'+
    '</div>';
 }
 async function advanceRec(){
@@ -2301,14 +2343,18 @@ async function advanceRec(){
   recCurrent = recBatch[recIdx];
   renderRecMovie(recCurrent);
 }
-async function nextRec(){ if(recBusy) return; recBusy = true; await advanceRec(); recBusy = false; }
+async function nextRec(){
+  if(recBusy) return; recBusy = true;
+  if(recCurrent) recPushUndo({type:'next', movie:recCurrent, idx:recIdx});   // skipping is undoable too
+  await advanceRec(); recBusy = false;
+}
 async function recAct(url, body, type){
   if(recBusy || !recCurrent) return; recBusy = true;
   const m = recCurrent, idx = recIdx;   // capture before we advance
   try {
     const res = await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
     if(res.stats) setTally(res.stats);
-    if(type){ recUndo = {type:type, movie:m, idx:idx}; }
+    if(type){ recPushUndo({type:type, movie:m, idx:idx}); }
   } catch(e){}
   await advanceRec(); recBusy = false;
 }
@@ -2316,18 +2362,21 @@ function recRate(v){ recAct('/api/rate', {rating:v, movie:recCurrent, stack:fals
 function recWatch(){ recAct('/api/watchlist', {movie:recCurrent, stack:false}, 'watch'); }
 function recNotInterested(){ recAct('/api/not-interested', {movie:recCurrent}, 'not-interested'); }
 
-/* ---- recommender undo (mirrors the rater's "Undo last action") ---- */
-let recUndo = null;   // {type, movie, idx} — the last action taken here
+/* ---- recommender undo (this window's own history; the rater's Undo is
+   separate — neither can reverse the other's actions) ---- */
+let recUndoStack = [];   // [{type:'next'|'rate'|'watch'|'not-interested', movie, idx}]
+function recPushUndo(u){ recUndoStack.push(u); if(recUndoStack.length > 30) recUndoStack.shift(); }
 async function recUndoAction(){
-  if(recBusy || !recUndo) return; recBusy = true;
-  const u = recUndo;
-  try {
-    const res = await (await fetch('/api/rec-undo',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({type:u.type, movie:u.movie})})).json();
-    if(res.stats) setTally(res.stats);
-  } catch(e){}
-  recUndo = null;
-  if(recBatch[u.idx] && recBatch[u.idx].id === u.movie.id) recIdx = u.idx;  // step back to it
+  if(recBusy || !recUndoStack.length) return; recBusy = true;
+  const u = recUndoStack.pop();
+  if(u.type !== 'next'){                       // data actions get reversed on disk...
+    try {
+      const res = await (await fetch('/api/rec-undo',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({type:u.type, movie:u.movie})})).json();
+      if(res.stats) setTally(res.stats);
+    } catch(e){}
+  }
+  if(recBatch[u.idx] && recBatch[u.idx].id === u.movie.id) recIdx = u.idx;   // ...then we step back to the film
   recCurrent = u.movie; renderRecMovie(u.movie);
   recBusy = false;
 }
@@ -2734,7 +2783,7 @@ async function nightPick(){
   btn.disabled=true; note.textContent='The projector is warming up…';
   let d=null;
   try{ d=await (await fetch('/api/movie-night',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({party:[...nightParty], n:12, combine:nightCombine})})).json(); }catch(e){}
+        body:JSON.stringify({party:[...nightParty], n:12, combine:nightCombine, model:modelPref})})).json(); }catch(e){}
   btn.disabled=false;
   if(!d||!d.ok){ note.textContent=(d&&d.error)?String(d.error):'The projector jammed — try again.'; return; }
   nightPicks=(d.data&&d.data.picks)||[]; nightIdx=-1;
@@ -3054,11 +3103,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": ok, "data": data} if ok else {"ok": False, "error": data}))
 
         elif self.path.startswith("/api/train"):
-            ok, data = run_recommender(["--train-only"])
+            mp = "auto"
+            try:
+                if raw:
+                    c = str(json.loads(raw).get("model") or "")
+                    if c in ("auto", "similarity", "linear", "fm"):
+                        mp = c
+            except Exception:
+                pass
+            ok, data = run_recommender(["--train-only", "--model", mp])
             self._send(200, json.dumps({"ok": ok, "data": data} if ok else {"ok": False, "error": data}))
 
         elif self.path.startswith("/api/recommend"):
-            n, explore, profile, fresh = 18, 0.3, "you", True
+            n, explore, profile, fresh, mp = 18, 0.3, "you", True, "auto"
             try:
                 if raw:
                     body = json.loads(raw)
@@ -3066,11 +3123,14 @@ class Handler(BaseHTTPRequestHandler):
                     explore = float(body.get("explore", 0.3))
                     profile = str(body.get("profile") or "you")[:60]
                     fresh = bool(body.get("fresh", True))
+                    c = str(body.get("model") or "")
+                    if c in ("auto", "similarity", "linear", "fm"):
+                        mp = c
             except Exception:
                 pass
             seen = _rec_seen.setdefault(profile, set())
             args = ["--source", "discover", "--n", str(n), "--explore", str(explore),
-                    "--profile", profile]
+                    "--profile", profile, "--model", mp]
             if fresh and seen:
                 args += ["--exclude", ",".join(str(i) for i in list(seen)[:2000])]
             ok, data = run_recommender(args)
@@ -3081,7 +3141,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": ok, "data": data} if ok else {"ok": False, "error": data}))
 
         elif self.path.startswith("/api/movie-night"):
-            party, n, combine = [], 8, "least_misery"
+            party, n, combine, mp = [], 8, "least_misery", "auto"
             try:
                 if raw:
                     body = json.loads(raw)
@@ -3090,10 +3150,13 @@ class Handler(BaseHTTPRequestHandler):
                     c = str(body.get("combine") or "")
                     if c in ("least_misery", "average", "avg_no_misery"):
                         combine = c
+                    cm = str(body.get("model") or "")
+                    if cm in ("auto", "similarity", "linear", "fm"):
+                        mp = cm
             except Exception:
                 pass
             ok, data = run_recommender(["--movie-night", "--party", json.dumps(party),
-                                        "--n", str(n), "--combine", combine])
+                                        "--n", str(n), "--combine", combine, "--model", mp])
             if ok and isinstance(data, dict):
                 for p in data.get("picks", []):
                     if isinstance(p.get("id"), int) and not p.get("poster"):

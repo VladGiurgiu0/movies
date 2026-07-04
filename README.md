@@ -32,8 +32,8 @@ dependency (NumPy).
   - **Add to Watchlist** for "want to watch later"
   - Films marked **Not seen** sit out by default; a toggle at the bottom of
     **Channels** re-shows them so you can re-decide — re-rating replaces the old
-    entry, never duplicates it. Hover any verdict button for a moment to see
-    exactly which file it writes to and how it trains your model.
+    entry, never duplicates it. A small **i** in each window's footer explains
+    exactly which file every button writes to and how it trains your model.
 - **Your lists, one tap away** — the stats line sits above the card, visible on
   both faces. Click the **Watchlist** count to slide up a sheet of everything
   you've saved, each with its poster; mark one **watched** (it moves into your
@@ -52,12 +52,15 @@ dependency (NumPy).
 - **Never repeats** — anything already in `movies.md`, `watchlist.md`, or
   `not-interested.md` is skipped, and **the recommender won't re-show a film
   you've already seen this session**, so every "Next" is fresh.
-- **Undo last action** in *both* windows — the rater and the recommender each
-  have their own, so a rating, a watchlist add, or a *Not interested* is always
-  one click from being reversed.
+- **Undo last action** in *both* windows — each keeps its **own history**, so
+  undo in one never reverses something done in the other. In the recommender it
+  also steps back through **Next recommendation**, so a skipped film is one
+  click from returning.
 - **Train** (in the **Model** panel) — learns a model from your ratings and shows
   its cross-validated quality and your top "taste drivers", with plain-language
-  tooltips for the jargon.
+  tooltips for the jargon. A **model switch** gives you the final say: *Auto*
+  (cross-validation decides), or force *Similarity*, *Linear*, or *FM* — the
+  choice applies everywhere, including Movie night.
 - **Recommend** — surfaces films ranked by your taste, **one at a time** with a
   **Next** button and a **Safe / Balanced / Exploratory** control; rate /
   add-to-watchlist / mark *Not interested* on any pick inline. Powered by
@@ -183,11 +186,18 @@ templates whenever they're missing, so a fresh clone just works.
 ## Recommender
 
 The [`ml-recommender/`](ml-recommender/) folder has a working recommender that
-learns from your ratings — content-similarity while labels are few, switching to
-a compact logistic-regression model once you've rated enough — and writes a
-ranked `recommendations.md`. It's NumPy-only, with a Core ML export for on-device
-use in the works; see its [README](ml-recommender/README.md) for how it works and
-why a small linear model is the right tool at this scale.
+learns from your ratings in three stages: **content similarity** while labels
+are few, a compact **logistic-regression model** once you've rated enough, and a
+**factorization machine** [10] — the same linear model plus learned pairwise
+feature interactions ("English-language × Animation") — which takes over
+automatically, but *only* when it beats the linear model in cross-validation by
+a clear margin. That conservatism is deliberate: across recommender-systems
+research, well-tuned simple models beat complex ones far more often than
+published results suggest [11, 12, 13], so every upgrade here has to prove
+itself on *your* data before it touches your recommendations — and the Model
+panel's **model switch** overrides the automatic choice whenever you want the
+final say. Everything is NumPy-only, with a Core ML export for on-device use in
+the works; see its [README](ml-recommender/README.md) for the details.
 
 ## How movie night decides (and why)
 
@@ -227,7 +237,20 @@ struggle to judge group picks without them [9]; at the same time, longer and
 more detailed explanations do not improve actual understanding [4], so the
 lines stay short.
 
-References:
+Numbered citations are collected in [References](#references) at the end.
+
+## Tests
+
+A small test suite covers the fragile parts (markdown parsing, atomic writes,
+the ranking metrics, and how ratings become training labels). The rater tests
+use only the standard library; the recommender tests need NumPy and skip
+automatically if it isn't installed. From the repo root:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## References
 
 1. Barile, F., Draws, T., Inel, O., et al. (2023). Evaluating explainable social
    choice-based aggregation strategies for group recommendation. *User Modeling
@@ -256,17 +279,18 @@ References:
    explanations on fairness perception in group recommender systems.
    *Proceedings of the 33rd ACM Conference on User Modeling, Adaptation and
    Personalization (UMAP)*.
-
-## Tests
-
-A small test suite covers the fragile parts (markdown parsing, atomic writes,
-the ranking metrics, and how ratings become training labels). The rater tests
-use only the standard library; the recommender tests need NumPy and skip
-automatically if it isn't installed. From the repo root:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+10. Rendle, S. (2010). Factorization machines. *Proceedings of the 10th IEEE
+    International Conference on Data Mining (ICDM)*.
+11. Ferrari Dacrema, M., Cremonesi, P., & Jannach, D. (2019). Are we really
+    making much progress? A worrying analysis of recent neural recommendation
+    approaches. *Proceedings of the 13th ACM Conference on Recommender Systems
+    (RecSys)*.
+12. Rendle, S., Zhang, L., & Koren, Y. (2019). On the difficulty of evaluating
+    baselines: A study on recommender systems. *arXiv:1905.01395*.
+13. Anelli, V. W., Bellogín, A., Di Noia, T., et al. (2022). Top-N
+    recommendation algorithms: A quest for the state-of-the-art. *Proceedings
+    of the 30th ACM Conference on User Modeling, Adaptation and Personalization
+    (UMAP)*.
 
 ## License
 

@@ -452,6 +452,21 @@ class TestShareExport(unittest.TestCase):
             json.dump(dict(good, theta=[0.5]), f)      # theta must be len(vocab)+1
         self.assertNotIn("model", tb.share_export())
 
+    def test_fm_model_exports_its_linear_twin(self):
+        # when a factorization machine is active, Share sends the linear twin
+        # stored inside it, so friends' importers keep working unchanged
+        fm = {"kind": "fm", "vocab": ["genre=Drama"], "w": [0.4], "b": 0.0,
+              "V": [[0.1, 0.2]], "mu": [0.2], "sd": [1.0], "version": "v1",
+              "cv": {"auc": 0.8},
+              "linear": {"theta": [0.5, 0.1], "mu": [0.2], "sd": [1.0], "cv": {"auc": 0.7}}}
+        with open(os.path.join(self.tmp, "model.json"), "w", encoding="utf-8") as f:
+            json.dump(fm, f)
+        s = tb.share_export()
+        self.assertEqual(s["model"]["theta"], [0.5, 0.1])      # the twin, not the FM
+        self.assertEqual(s["model"]["cv"], {"auc": 0.7})
+        fr = tb._clean_friend(dict(s, name="FMFriend"))
+        self.assertIn("model", fr)                             # imports as plain linear
+
 
 class TestCleanFriend(unittest.TestCase):
     """Importing a friend keeps the new fields, survives old files, rejects junk."""
@@ -588,6 +603,78 @@ class TestMovieNight(unittest.TestCase):
         self.assertEqual(p10["group_score"], min(p10["scores"].values()))   # least misery
         self.assertEqual(res["how"], {"You": "similarity", "Anna": "similarity"})
         self.assertEqual(res["missing"], [])
+
+    def test_fm_learns_interactions_linear_cannot(self):
+        # y = x1 XOR x2 is the canonical interaction: no linear model separates it,
+        # a rank-k factorization machine does (Rendle 2010).
+        import numpy as np
+        rng = np.random.default_rng(3)
+        X = rng.integers(0, 2, size=(240, 2)).astype(float)
+        y = (X[:, 0].astype(int) ^ X[:, 1].astype(int)).astype(float)
+        lin = rec.train_logreg(X, y)
+        fm = rec.train_fm(X, y, k=4, iters=1500, lr=0.2, seed=1)
+        auc_lin = rec.roc_auc(y, rec.proba(lin, X))
+        auc_fm = rec.roc_auc(y, rec.fm_proba(fm, X))
+        self.assertLess(auc_lin, 0.65)                 # linear can't do XOR
+        self.assertGreater(auc_fm, 0.85)               # the FM can
+        self.assertGreater(auc_fm, auc_lin + rec.FM_MARGIN)
+
+    def test_model_kind_dispatch(self):
+        import numpy as np
+        X = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        y = np.array([1.0, 0.0, 1.0])
+        lin = rec.train_logreg(X, y)
+        fm = rec.train_fm(X, y, k=2, iters=200)
+        self.assertEqual(rec.model_kind(lin), "linear")
+        self.assertEqual(rec.model_kind(fm), "fm")
+        self.assertEqual(len(rec.score_model(lin, X)), 3)
+        self.assertEqual(len(rec.score_model(fm, X)), 3)
+        self.assertEqual(len(rec.linear_weights(lin)), 2)
+        self.assertEqual(len(rec.linear_weights(fm)), 2)
+        self.assertEqual(rec.top_interactions(lin, ["a=1", "b=1"]), [])   # linear: none
+
+    def test_choose_kind_pref_overrides_gate(self):
+        lo = {"auc": 0.70}; hi = {"auc": 0.78}
+        self.assertEqual(rec.choose_kind("auto", lo, hi), "fm")       # gate: FM wins
+        self.assertEqual(rec.choose_kind("auto", hi, lo), "linear")   # gate: FM loses
+        self.assertEqual(rec.choose_kind("auto", lo, {"auc": 0.705}), "linear")  # inside margin
+        self.assertEqual(rec.choose_kind("linear", lo, hi), "linear")  # forced beats gate
+        self.assertEqual(rec.choose_kind("fm", hi, lo), "fm")
+        self.assertEqual(rec.choose_kind("auto", None, hi), "linear")  # no CV -> conservative
+
+    def test_model_of_kind_pulls_twins_from_cache(self):
+        fm_root = {"kind": "fm", "vocab": ["a"], "w": [0.1], "b": 0.0, "V": [[0.1]],
+                   "mu": [0.0], "sd": [1.0],
+                   "linear": {"theta": [0.2, 0.0], "mu": [0.1], "sd": [1.0]}}
+        self.assertEqual(rec.model_kind(rec.model_of_kind(fm_root, "auto")), "fm")
+        lin = rec.model_of_kind(fm_root, "linear")
+        self.assertEqual(rec.model_kind(lin), "linear")
+        self.assertEqual(lin["theta"], [0.2, 0.0])
+        self.assertEqual(lin["vocab"], ["a"])                          # twin inherits vocab
+        lin_root = {"theta": [0.2, 0.0], "vocab": ["a"], "mu": [0.1], "sd": [1.0],
+                    "fm_alt": {"w": [0.1], "b": 0.0, "V": [[0.1]], "mu": [0.0], "sd": [1.0]}}
+        fm = rec.model_of_kind(lin_root, "fm")
+        self.assertEqual(rec.model_kind(fm), "fm")
+        self.assertIsNone(rec.model_of_kind({"theta": [0.2, 0.0], "vocab": ["a"]}, "fm"))  # no twin
+
+    def test_own_participant_honors_model_pref(self):
+        import numpy as np
+        fm_root = {"kind": "fm", "vocab": ["genre=Drama"], "w": [0.1], "b": 0.0,
+                   "V": [[0.1, 0.1]], "mu": [0.0], "sd": [1.0], "version": rec.MODEL_VERSION,
+                   "linear": {"theta": [0.2, 0.0], "mu": [0.1], "sd": [1.0]}}
+        path = os.path.join(tempfile.mkdtemp(), "model.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(fm_root, f)
+        orig = rec.MODEL_PATH; rec.MODEL_PATH = path
+        try:
+            p_auto = rec._own_participant([], "auto")
+            p_lin = rec._own_participant([], "linear")
+            p_sim = rec._own_participant([], "similarity")
+        finally:
+            rec.MODEL_PATH = orig
+        self.assertEqual(rec.model_kind(p_auto["model"]), "fm")        # auto -> cached root
+        self.assertEqual(rec.model_kind(p_lin["model"]), "linear")     # forced -> the twin
+        self.assertNotIn("model", p_sim)                               # forced similarity
 
     def test_friend_model_schema_gate(self):
         feats = [{"genre=Drama": 1.0}]

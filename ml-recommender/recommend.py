@@ -280,6 +280,135 @@ def proba(model, X):
     return 1.0 / (1.0 + np.exp(-np.clip(Xb @ theta, -30, 30)))
 
 
+# --------------------------------------------------------------------------
+# Factorization machine (Rendle, ICDM 2010) — the linear model plus factorized
+# pairwise feature interactions:
+#     z = b + w.x + sum_{i<j} <v_i, v_j> x_i x_j
+# Each feature gets a small latent vector v_i in R^k; the interaction strength
+# of any feature pair is the dot product of their vectors, so interactions are
+# learned even for pairs never observed together (the factorization is what
+# makes this work under extreme sparsity). The pairwise sum is computed in
+# linear time via 0.5*(||Vx||^2 - sum_i ||v_i||^2 x_i^2). An FM with k=0 is
+# exactly the logistic model above. Activated only when it clearly beats the
+# linear model in the same cross-validation (see FM_MARGIN).
+# --------------------------------------------------------------------------
+FM_K = 6          # latent dimension of the interaction factors
+FM_MARGIN = 0.015 # the FM must beat the linear model's CV AUC by this to take over
+
+
+def train_fm(X, y, w=None, k=FM_K, l2_w=1.0, l2_v=2.0, iters=2000, lr=0.1,
+             class_balance=True, seed=0):
+    # NOTE: unlike train_logreg, the FM trains on RAW features. Standardizing
+    # one-hot columns blows up rare features ((1-mu)/sd is huge when a feature
+    # appears once) and the interaction term squares that — divergence. Raw
+    # binary/bounded features keep the pairwise term well-conditioned; mu=0 and
+    # sd=1 are stored so downstream code treats both model kinds identically.
+    X = np.asarray(X, float); y = np.asarray(y, float)
+    n, d = X.shape
+    sw = np.ones(n) if w is None else np.asarray(w, float).copy()
+    if class_balance:                       # so the minority class isn't drowned out
+        pos = (y == 1).sum(); neg = (y == 0).sum()
+        if pos > 0 and neg > 0:
+            sw = sw * np.where(y == 1, (pos + neg) / (2.0 * pos), (pos + neg) / (2.0 * neg))
+    sw = sw / sw.mean()
+    X2 = X * X
+    for attempt in range(3):                # halve the step and retry on divergence
+        rng = np.random.default_rng(seed + attempt)
+        wv = np.zeros(d); b = 0.0
+        V = rng.normal(0.0, 0.03, size=(d, k))
+        step = lr / (2 ** attempt)
+        ok = True
+        for _ in range(iters):
+            S1 = X @ V                                                # n x k
+            z = b + X @ wv + 0.5 * (S1 * S1 - X2 @ (V * V)).sum(axis=1)
+            if not np.isfinite(z).all():
+                ok = False
+                break
+            p = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+            g = (p - y) * sw / n
+            grad_w = X.T @ g + (l2_w / n) * wv
+            grad_V = X.T @ (g[:, None] * S1) - V * (X2.T @ g)[:, None] + (l2_v / n) * V
+            b -= step * float(g.sum())
+            wv -= step * grad_w
+            V -= step * grad_V
+        if ok:
+            break
+    return {"kind": "fm", "w": wv.tolist(), "b": b, "V": V.tolist(),
+            "mu": [0.0] * d, "sd": [1.0] * d}
+
+
+def fm_proba(model, X):
+    X = np.asarray(X, float)
+    Xs = (X - np.array(model["mu"])) / np.array(model["sd"])   # identity for FMs (raw features)
+    V = np.array(model["V"]); wv = np.array(model["w"])
+    S1 = Xs @ V
+    z = model["b"] + Xs @ wv + 0.5 * (S1 * S1 - (Xs * Xs) @ (V * V)).sum(axis=1)
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+
+
+def model_kind(model):
+    return "fm" if (isinstance(model, dict) and model.get("kind") == "fm") else "linear"
+
+
+def score_model(model, X):
+    """P(like) from either model kind."""
+    return fm_proba(model, X) if model_kind(model) == "fm" else proba(model, X)
+
+
+def linear_weights(model):
+    """The linear-term weights of either kind — the interpretable part that
+    feeds the taste drivers and the per-film 'why' lines."""
+    return np.array(model["w"]) if model_kind(model) == "fm" else np.array(model["theta"])[:-1]
+
+
+MODEL_PREFS = ("auto", "similarity", "linear", "fm")
+
+
+def choose_kind(pref, cv_lin, cv_fm):
+    """Which trained model ranks: the user's explicit choice, or the CV gate."""
+    if pref == "linear":
+        return "linear"
+    if pref == "fm":
+        return "fm"
+    return "fm" if (cv_lin and cv_fm and cv_fm["auc"] > cv_lin["auc"] + FM_MARGIN) else "linear"
+
+
+def model_of_kind(cached, pref):
+    """Pull the requested model kind out of the cache. The auto pick sits at the
+    root; the other kind rides along as a twin ('linear' / 'fm_alt'), so a
+    manual switch in the Model panel needs no retraining. None if absent."""
+    if not isinstance(cached, dict):
+        return None
+    kind = model_kind(cached)
+    want = kind if pref in (None, "", "auto") else pref
+    if want == kind:
+        return cached
+    vocab = cached.get("vocab")
+    if want == "linear" and isinstance(cached.get("linear"), dict):
+        return dict(cached["linear"], vocab=vocab)
+    if want == "fm" and isinstance(cached.get("fm_alt"), dict):
+        return dict(cached["fm_alt"], kind="fm", vocab=vocab)
+    return None
+
+
+def top_interactions(model, vocab, base=40, topn=5):
+    """FM only: the strongest learned feature-pair interactions among the
+    features with the largest linear weights, readable as 'A x B'."""
+    if model_kind(model) != "fm":
+        return []
+    wv = np.abs(linear_weights(model)); V = np.array(model["V"])
+    cand = [i for i in np.argsort(-wv)[:base] if "=" in vocab[i]]
+    pairs = []
+    for a in range(len(cand)):
+        for c in range(a + 1, len(cand)):
+            i, j = cand[a], cand[c]
+            s = float(V[i] @ V[j])
+            pairs.append((abs(s), s, vocab[i], vocab[j]))
+    pairs.sort(reverse=True)
+    return [[humanize_feature(fi) + " × " + humanize_feature(fj), round(s, 3)]
+            for _, s, fi, fj in pairs[:topn]]
+
+
 def stratified_folds(y, k, seed=0):
     rng = np.random.default_rng(seed)
     folds = [[] for _ in range(k)]
@@ -523,15 +652,17 @@ def load_cached_model(sig):
             m = json.load(f)
     except Exception:
         return None
-    if m.get("data_sig") == sig and "vocab" in m and "theta" in m:
+    if m.get("data_sig") == sig and "vocab" in m and ("theta" in m or m.get("kind") == "fm"):
         return m
     return None
 
 
 def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
-        profile="you", exclude_ids=None):
+        profile="you", exclude_ids=None, model_pref="auto"):
     # profile is "you" (your taste) or a friend's name. exclude_ids = films already
     # shown this session, so a fresh Recommend batch never repeats them.
+    # model_pref: "auto" (CV gate decides) or a forced "similarity"/"linear"/"fm".
+    model_pref = model_pref if model_pref in MODEL_PREFS else "auto"
     exclude_ids = set(exclude_ids or [])
     is_friend = profile != "you"
     movies = load_movies(); watchlist = load_watchlist()
@@ -552,10 +683,11 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
     metas = tf.get_features(all_ids, CACHE, api_key=api_key, allow_network=not offline)
     enriched = sum(1 for i in all_ids if metas.get(i, {}).get("keywords"))
 
-    use_model = n_pos >= MIN_POS_FOR_MODEL and n_neg >= MIN_NEG_FOR_MODEL
+    enough = n_pos >= MIN_POS_FOR_MODEL and n_neg >= MIN_NEG_FOR_MODEL
+    use_model = enough and model_pref != "similarity"
     result = {"mode": "model" if use_model else "similarity", "n_pos": n_pos, "n_neg": n_neg,
               "candidate_source": cand_source, "candidate_count": len(candidates),
-              "enriched": enriched, "total_ids": len(all_ids),
+              "enriched": enriched, "total_ids": len(all_ids), "model_pref": model_pref,
               "cv": None, "drivers": [], "recommendations": [], "message": ""}
 
     if not train and not candidates:
@@ -566,36 +698,69 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
     if use_model:
         sig = data_signature(train, y, w)
         cached = None if train_only else load_cached_model(sig)
-        if cached is not None:
-            # reuse the model trained earlier on this exact data — no retrain
-            model = cached
-            result["cv"] = cached.get("cv")
-            vocab = model["vocab"]
+        model = model_of_kind(cached, model_pref) if cached is not None else None
+        if model is not None:
+            # reuse a model trained earlier on this exact data — no retrain
+            # (the cache carries both kinds, so a manual switch also lands here)
+            result["cv_linear"] = cached.get("cv_linear"); result["cv_fm"] = cached.get("cv_fm")
+            result["cv"] = ((result["cv_fm"] if model_kind(model) == "fm" else result["cv_linear"])
+                            or cached.get("cv"))
+            result["model_kind_auto"] = model_kind(cached)
+            vocab = cached["vocab"]
         else:
             tfe = [featurize(m, metas) for m in train]
             vec = Vectorizer().fit(tfe)
             Xtr = vec.transform(tfe); ytr = np.array(y); wtr = np.array(w)
             k = min(5, n_pos, n_neg)
+            cv_lin = cv_fm = None
             if k >= 2:
-                aucs, aps = [], []
-                for fold in stratified_folds(ytr, k):
-                    te = set(fold.tolist()); tr = np.array([i for i in range(len(ytr)) if i not in te])
-                    if len(np.unique(ytr[tr])) < 2 or len(np.unique(ytr[fold])) < 2:
-                        continue
-                    mdl = train_logreg(Xtr[tr], ytr[tr], wtr[tr])
-                    ps = proba(mdl, Xtr[fold])
-                    aucs.append(roc_auc(ytr[fold], ps)); aps.append(average_precision(ytr[fold], ps))
-                if aucs:
-                    result["cv"] = {"auc": float(np.nanmean(aucs)), "ap": float(np.nanmean(aps)), "k": k}
-            model = train_logreg(Xtr, ytr, wtr)
-            model["vocab"] = vec.vocab; model["cv"] = result["cv"]; model["data_sig"] = sig
-            model["version"] = MODEL_VERSION   # rides along into share exports
-            _atomic_write(MODEL_PATH, json.dumps(model))
+                folds = stratified_folds(ytr, k)
+
+                def cv_of(trainer, scorer):
+                    aucs, aps = [], []
+                    for fold in folds:
+                        te = set(fold.tolist()); tr = np.array([i for i in range(len(ytr)) if i not in te])
+                        if len(np.unique(ytr[tr])) < 2 or len(np.unique(ytr[fold])) < 2:
+                            continue
+                        mdl = trainer(Xtr[tr], ytr[tr], wtr[tr])
+                        ps = scorer(mdl, Xtr[fold])
+                        aucs.append(roc_auc(ytr[fold], ps)); aps.append(average_precision(ytr[fold], ps))
+                    return ({"auc": float(np.nanmean(aucs)), "ap": float(np.nanmean(aps)), "k": k}
+                            if aucs else None)
+
+                cv_lin = cv_of(train_logreg, proba)
+                cv_fm = cv_of(lambda X_, y_, w_: train_fm(X_, y_, w_, iters=800), fm_proba)
+            # the gate decides the AUTO pick; a manual choice overrides what RANKS,
+            # but both kinds are always trained and cached, so switching is free
+            kind_auto = choose_kind("auto", cv_lin, cv_fm)
+            kind_used = choose_kind(model_pref, cv_lin, cv_fm)
+            result["model_kind_auto"] = kind_auto
+            result["cv"] = cv_fm if kind_used == "fm" else cv_lin
+            result["cv_linear"] = cv_lin; result["cv_fm"] = cv_fm
+            lin = train_logreg(Xtr, ytr, wtr)
+            fmm = train_fm(Xtr, ytr, wtr)
+            model = fmm if kind_used == "fm" else lin
+            # cache the AUTO pick at the root; the other kind rides along as a
+            # twin. The linear twin is also what Share exports when the FM leads,
+            # so friends' importers (which expect the linear shape) still work.
+            cmodel = dict(fmm if kind_auto == "fm" else lin)
+            if kind_auto == "fm":
+                cmodel["linear"] = {"theta": lin["theta"], "mu": lin["mu"], "sd": lin["sd"], "cv": cv_lin}
+            else:
+                cmodel["fm_alt"] = {"w": fmm["w"], "b": fmm["b"], "V": fmm["V"],
+                                    "mu": fmm["mu"], "sd": fmm["sd"], "cv": cv_fm}
+            cmodel["vocab"] = vec.vocab; cmodel["data_sig"] = sig
+            cmodel["cv"] = cv_fm if kind_auto == "fm" else cv_lin
+            cmodel["cv_linear"] = cv_lin; cmodel["cv_fm"] = cv_fm
+            cmodel["version"] = MODEL_VERSION   # rides along into share exports
+            _atomic_write(MODEL_PATH, json.dumps(cmodel))
             vocab = vec.vocab
 
-        theta = np.array(model["theta"])[:-1]
+        theta = linear_weights(model)
+        result["model_kind"] = model_kind(model)
         result["drivers"] = [[nm, round(float(c), 3)] for nm, c in
                              sorted(zip(vocab, theta), key=lambda t: -abs(t[1]))[:8]]
+        result["drivers"] += top_interactions(model, vocab)   # FM only; 'A × B' pairs
         cv_auc = result["cv"]["auc"] if result["cv"] else None
 
         if candidates:
@@ -603,7 +768,7 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
                 # model is beating chance -> use it to rank
                 vec2 = Vectorizer(vocab)
                 cfe = [featurize(m, metas) for m in candidates]
-                Xc = vec2.transform(cfe); scores = proba(model, Xc)
+                Xc = vec2.transform(cfe); scores = score_model(model, Xc)
                 Xcs = (Xc - np.array(model["mu"])) / np.array(model["sd"])
                 for i, m in enumerate(candidates):
                     pairs = [(nm, c) for nm, c in zip(vocab, Xcs[i] * theta) if "=" in nm and c > 0]
@@ -626,6 +791,9 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
         liked = [m for m, l in zip(train, y) if l == 1]
         disliked = [m for m, l in zip(train, y) if l == 0]
         if train_only:
+            if model_pref == "similarity" and enough:
+                result["message"] = "Similarity mode — your choice in the Model panel."
+                return result
             need = []
             if n_pos < MIN_POS_FOR_MODEL: need.append(f"{MIN_POS_FOR_MODEL - n_pos} more liked")
             if n_neg < MIN_NEG_FOR_MODEL: need.append(f"{MIN_NEG_FOR_MODEL - n_neg} more not-liked")
@@ -738,9 +906,9 @@ def _person_scores(person, cand_feats, metas):
         try:
             vocab = mdl["vocab"]
             X = Vectorizer(vocab).transform(cand_feats)
-            sc = proba(mdl, X)
+            sc = score_model(mdl, X)           # linear or FM, whichever they run
             Xs = (X - np.array(mdl["mu"])) / np.array(mdl["sd"])
-            theta = np.array(mdl["theta"])[:-1]
+            theta = linear_weights(mdl)
             whys = []
             for i in range(n):
                 pairs = [(nm, c) for nm, c in zip(vocab, Xs[i] * theta) if "=" in nm and c > 0]
@@ -764,19 +932,26 @@ def _person_scores(person, cand_feats, metas):
     return np.zeros(n), "none", ["no taste data yet"] * n
 
 
-def _own_participant(movies):
+def _own_participant(movies, model_pref="auto"):
     """You, as a movie-night participant: the cached trained model when present
-    (even a slightly stale one beats retraining mid-party), else likes/dislikes."""
+    (even a slightly stale one beats retraining mid-party), else likes/dislikes.
+    Honors the Model panel's manual choice, including forced similarity."""
     person = {"name": "You",
               "likes": [m for m in movies if m["rating"] == 3],
               "dislikes": [m for m in movies if m["rating"] == 1]}
+    if model_pref == "similarity":
+        return person
     try:
         with open(MODEL_PATH, "r", encoding="utf-8") as f:
-            m = json.load(f)
-        if (isinstance(m.get("vocab"), list) and isinstance(m.get("theta"), list)
-                and len(m["theta"]) == len(m["vocab"]) + 1):
-            person["model"] = {"schema": str(m.get("version", MODEL_VERSION)), "vocab": m["vocab"],
-                               "theta": m["theta"], "mu": m["mu"], "sd": m["sd"]}
+            raw = json.load(f)
+        m = model_of_kind(raw, model_pref)
+        if m is None:
+            return person
+        ok_linear = (isinstance(m.get("theta"), list)
+                     and len(m["theta"]) == len(m.get("vocab") or []) + 1)
+        ok_fm = (m.get("kind") == "fm" and isinstance(m.get("V"), list))
+        if isinstance(m.get("vocab"), list) and (ok_linear or ok_fm):
+            person["model"] = dict(m, schema=str(raw.get("version", MODEL_VERSION)))
     except Exception:
         pass
     return person
@@ -827,13 +1002,14 @@ COMBINE_OPS = ("least_misery", "average", "avg_no_misery")
 MISERY_FLOOR = 0.25   # avg_no_misery: a film under this percentile for anyone is floored
 
 
-def movie_night(party, n=8, offline=False, combine="least_misery"):
+def movie_night(party, n=8, offline=False, combine="least_misery", model_pref="auto"):
     """Pick films for the group: you + the named imported friends."""
     combine = combine if combine in COMBINE_OPS else "least_misery"
+    model_pref = model_pref if model_pref in MODEL_PREFS else "auto"
     movies = load_movies()
     watchlist = load_watchlist()
     by_name = {(f.get("name") or "a friend"): f for f in load_friends()}
-    people = [_own_participant(movies)]
+    people = [_own_participant(movies, model_pref)]
     missing = []
     for name in party:
         if name in by_name:
@@ -976,6 +1152,8 @@ def main():
     ap.add_argument("--party", default="[]", help='JSON list of imported friend names joining movie night')
     ap.add_argument("--combine", default="least_misery", choices=list(COMBINE_OPS),
                     help="how the group combines individual scores")
+    ap.add_argument("--model", default="auto", choices=list(MODEL_PREFS),
+                    help="which model ranks: auto (CV gate) or a forced choice")
     args = ap.parse_args()
     if args.rebuild_cache:
         try:
@@ -988,13 +1166,14 @@ def main():
             party = [str(x) for x in json.loads(args.party or "[]")]
         except Exception:
             party = []
-        result = movie_night(party, n=args.n, offline=args.offline, combine=args.combine)
+        result = movie_night(party, n=args.n, offline=args.offline, combine=args.combine,
+                             model_pref=args.model)
         print(json.dumps(result) if args.json else json.dumps(result, indent=2))
         return
     excl = {int(x) for x in args.exclude.split(",") if x.strip().isdigit()}
     result = run(n=args.n, source=args.source, offline=args.offline,
                  train_only=args.train_only, explore=args.explore,
-                 profile=args.profile, exclude_ids=excl)
+                 profile=args.profile, exclude_ids=excl, model_pref=args.model)
     if args.json:
         print(json.dumps(result))
     else:
