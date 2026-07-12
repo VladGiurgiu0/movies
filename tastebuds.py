@@ -58,21 +58,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # --------------------------------------------------------------------------
 # Config / paths
 # --------------------------------------------------------------------------
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MD_PATH = os.path.join(SCRIPT_DIR, "movies.md")
-WATCHLIST_PATH = os.path.join(SCRIPT_DIR, "watchlist.md")
-NOT_INTERESTED_PATH = os.path.join(SCRIPT_DIR, "not-interested.md")
-NOT_INTERESTED_LEGACY_PATH = os.path.join(SCRIPT_DIR, "dismissed.md")  # migrated on first run
-CHANNELS_PATH = os.path.join(SCRIPT_DIR, "channels.json")
-ML_DIR = os.path.join(SCRIPT_DIR, "ml-recommender")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # where the CODE lives
+# Where the DATA lives. Normally the same folder (run from a clone, everything
+# sits together, git-ignored). A packaged app sets TASTEBUDS_HOME to a normal
+# user folder (e.g. ~/Tastebuds) so your files stay visible, editable, and
+# outside any app bundle — you own your data, wherever the code runs from.
+DATA_DIR = os.path.abspath(os.path.expanduser(os.environ.get("TASTEBUDS_HOME") or SCRIPT_DIR))
+if DATA_DIR != SCRIPT_DIR:
+    os.makedirs(DATA_DIR, exist_ok=True)
+MD_PATH = os.path.join(DATA_DIR, "movies.md")
+WATCHLIST_PATH = os.path.join(DATA_DIR, "watchlist.md")
+NOT_INTERESTED_PATH = os.path.join(DATA_DIR, "not-interested.md")
+NOT_INTERESTED_LEGACY_PATH = os.path.join(DATA_DIR, "dismissed.md")  # migrated on first run
+CHANNELS_PATH = os.path.join(DATA_DIR, "channels.json")
+ML_DIR = os.path.join(SCRIPT_DIR, "ml-recommender")            # code
+ML_DATA_DIR = os.path.join(DATA_DIR, "ml-recommender")         # its caches + model
 RECOMMEND_PY = os.path.join(ML_DIR, "recommend.py")
-DIRECTOR_CACHE_PATH = os.path.join(SCRIPT_DIR, "director_cache.json")
-POSTER_CACHE_PATH = os.path.join(SCRIPT_DIR, "poster_cache.json")   # cached poster paths (watchlist view)
-FRIENDS_PATH = os.path.join(SCRIPT_DIR, "friends.json")   # multi-friend list [{name, likes}]
-FRIEND_PATH = os.path.join(SCRIPT_DIR, "friend.json")     # legacy single-friend file (migrated on read)
-PROVIDERS_PATH = os.path.join(SCRIPT_DIR, "providers.json")  # {region, providers:[ids]} streaming filter
-KEY_PATH = os.path.join(SCRIPT_DIR, "tmdb_key.txt")          # where a pasted TMDb key is stored
-WEIGHTS_PATH = os.path.join(SCRIPT_DIR, "model_weights.json")  # per-reaction training weights
+DIRECTOR_CACHE_PATH = os.path.join(DATA_DIR, "director_cache.json")
+POSTER_CACHE_PATH = os.path.join(DATA_DIR, "poster_cache.json")   # cached poster paths (watchlist view)
+FRIENDS_PATH = os.path.join(DATA_DIR, "friends.json")   # multi-friend list [{name, likes}]
+FRIEND_PATH = os.path.join(DATA_DIR, "friend.json")     # legacy single-friend file (migrated on read)
+PROVIDERS_PATH = os.path.join(DATA_DIR, "providers.json")  # {region, providers:[ids]} streaming filter
+KEY_PATH = os.path.join(DATA_DIR, "tmdb_key.txt")          # where a pasted TMDb key is stored
+WEIGHTS_PATH = os.path.join(DATA_DIR, "model_weights.json")  # per-reaction training weights
 TABLE_END_MARKER = "<!-- TABLE-END -->"
 
 MD_ID_COL = 5          # TMDb ID column index in movies.md rows
@@ -716,7 +724,7 @@ SHARE_VERSION = 2   # share-file payload format
 def _portable_model():
     """Your trained model in a friend-portable shape (vocab + weights + scaling +
     schema version), or None when no model has been trained yet."""
-    path = os.path.join(ML_DIR, "model.json")
+    path = os.path.join(ML_DATA_DIR, "model.json")
     if not os.path.exists(path):
         return None
     try:
@@ -1092,7 +1100,43 @@ def get_rated(status):
 # ML recommender bridge (runs ml-recommender/recommend.py as a subprocess so
 # the rater itself stays dependency-free)
 # --------------------------------------------------------------------------
+def _run_recommender_inproc(extra_args):
+    """The recommender without a subprocess — for the packaged app, where
+    sys.executable is the app binary, not Python (PyInstaller). Reuses
+    recommend.py's own CLI entry via argv + captured stdout, so behavior and
+    output stay identical to the subprocess path."""
+    import io
+    import contextlib
+    if ML_DIR not in sys.path:
+        sys.path.insert(0, ML_DIR)
+    try:
+        import recommend
+    except ImportError as e:
+        if "numpy" in str(e).lower():
+            return False, ("NumPy isn't installed (the recommender needs it). In Terminal:\n"
+                           "pip install -r ml-recommender/requirements.txt")
+        return False, str(e)
+    argv, out = sys.argv, io.StringIO()
+    try:
+        sys.argv = ["recommend.py", "--json"] + list(extra_args)
+        with contextlib.redirect_stdout(out):
+            recommend.main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            return False, "The recommender failed (exit %s)." % e.code
+    except Exception as e:
+        return False, str(e)
+    finally:
+        sys.argv = argv
+    try:
+        return True, json.loads(out.getvalue().strip().splitlines()[-1])
+    except Exception:
+        return False, "Couldn't parse the recommender's output."
+
+
 def run_recommender(extra_args, timeout=600):
+    if getattr(sys, "frozen", False) or os.environ.get("TASTEBUDS_INPROC") == "1":
+        return _run_recommender_inproc(extra_args)
     if not os.path.exists(RECOMMEND_PY):
         return False, "The ml-recommender folder isn't here."
     try:
@@ -1120,12 +1164,278 @@ def run_recommender(extra_args, timeout=600):
 
 
 # --------------------------------------------------------------------------
+# LAN mode + QR pairing (all stdlib, like the rest of the rater)
+#
+# Off by default: the server binds 127.0.0.1 with a fresh token per run, as
+# always. With --lan (or TASTEBUDS_LAN=1) it binds the local network on a
+# stable port with a PERSISTENT pairing token, so a phone's home-screen icon
+# keeps working across restarts. Non-local visitors must present the token
+# (?t=...) to get the page — delivered by scanning the QR in "Pair a phone".
+# The Host-header check still pins requests to loopback or our advertised LAN
+# IP, so DNS-rebinding stays closed.
+# --------------------------------------------------------------------------
+LAN_MODE = False
+LAN_IP = None
+LAN_PORT = None
+LAN_PORT_DEFAULT = 8765
+LAN_TOKEN_PATH = os.path.join(DATA_DIR, "lan_token.txt")
+
+
+def lan_ip():
+    """This machine's LAN address (no packets sent)."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.254.254.254", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def persistent_token():
+    """The pairing token for LAN mode — minted once, kept in your data folder."""
+    try:
+        with open(LAN_TOKEN_PATH, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+        if len(t) == 32 and all(c in "0123456789abcdef" for c in t):
+            return t
+    except Exception:
+        pass
+    t = secrets.token_hex(16)
+    try:
+        _atomic_write(LAN_TOKEN_PATH, t)
+    except Exception:
+        pass
+    return t
+
+
+def pair_url():
+    return f"http://{LAN_IP}:{LAN_PORT}/?t={TOKEN}" if LAN_MODE else None
+
+
+# ---- QR encoder (byte mode, ECC level M, versions 1-10) --------------------
+_QR_DATA_CW = {1: 16, 2: 28, 3: 44, 4: 64, 5: 86, 6: 108, 7: 124, 8: 154, 9: 182, 10: 216}
+_QR_BLOCKS = {1: [(1, 16, 10)], 2: [(1, 28, 16)], 3: [(1, 44, 26)], 4: [(2, 32, 18)],
+              5: [(2, 43, 24)], 6: [(4, 27, 16)], 7: [(4, 31, 18)],
+              8: [(2, 38, 22), (2, 39, 22)], 9: [(3, 36, 22), (2, 37, 22)],
+              10: [(4, 43, 26), (1, 44, 26)]}
+_QR_ALIGN = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
+             7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]}
+_QR_REMAINDER = {1: 0, 2: 7, 3: 7, 4: 7, 5: 7, 6: 7, 7: 0, 8: 0, 9: 0, 10: 0}
+
+_GF_EXP = [0] * 512
+_GF_LOG = [0] * 256
+_x = 1
+for _i in range(255):
+    _GF_EXP[_i] = _x
+    _GF_LOG[_x] = _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+for _i in range(255, 512):
+    _GF_EXP[_i] = _GF_EXP[_i - 255]
+
+
+def _gf_mul(a, b):
+    return 0 if (a == 0 or b == 0) else _GF_EXP[_GF_LOG[a] + _GF_LOG[b]]
+
+
+def _rs_ecc(data, n_ecc):
+    gen = [1]                                  # product of (x - a^i), highest power first
+    for i in range(n_ecc):
+        nxt = gen + [0]                        # gen * x
+        for j, g in enumerate(gen):            # + gen * a^i
+            nxt[j + 1] ^= _gf_mul(g, _GF_EXP[i])
+        gen = nxt
+    rem = [0] * n_ecc
+    for d in data:
+        factor = d ^ rem[0]
+        rem = rem[1:] + [0]
+        for j in range(n_ecc):
+            rem[j] ^= _gf_mul(gen[j + 1], factor)
+    return rem
+
+
+def _bch_remainder(data, poly, poly_bits, total_bits):
+    v = data << (poly_bits - 1)
+    for i in range(total_bits - 1, poly_bits - 2, -1):
+        if v & (1 << i):
+            v ^= poly << (i - (poly_bits - 1))
+    return v
+
+
+def _qr_matrix(payload):
+    """payload: bytes. Returns the module matrix (list of rows of 0/1)."""
+    version = next((v for v in range(1, 11) if _QR_DATA_CW[v] - 2 >= len(payload)), None)
+    if version is None:
+        raise ValueError("payload too long for QR v10")
+    n_data = _QR_DATA_CW[version]
+    # --- bit stream: mode 0100, 8-bit count (v1-9) / 16-bit (v10), data, terminator, pad
+    bits = "0100" + format(len(payload), "016b" if version >= 10 else "08b")
+    bits += "".join(format(b, "08b") for b in payload)
+    bits += "0" * min(4, n_data * 8 - len(bits))
+    if len(bits) % 8:
+        bits += "0" * (8 - len(bits) % 8)
+    pads = ("11101100", "00010001")
+    i = 0
+    while len(bits) < n_data * 8:
+        bits += pads[i % 2]; i += 1
+    cw = [int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)]
+    # --- split into blocks, compute ECC, interleave
+    blocks, eccs, pos = [], [], 0
+    for count, dlen, elen in _QR_BLOCKS[version]:
+        for _ in range(count):
+            block = cw[pos:pos + dlen]; pos += dlen
+            blocks.append(block); eccs.append(_rs_ecc(block, elen))
+    final = []
+    for i in range(max(len(b) for b in blocks)):
+        for b in blocks:
+            if i < len(b):
+                final.append(b[i])
+    for i in range(len(eccs[0])):
+        for e in eccs:
+            final.append(e[i])
+    stream = "".join(format(b, "08b") for b in final) + "0" * _QR_REMAINDER[version]
+    # --- module matrix with function patterns
+    size = 17 + 4 * version
+    M = [[None] * size for _ in range(size)]
+
+    def put_finder(r, c):
+        for dr in range(-1, 8):
+            for dc in range(-1, 8):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < size and 0 <= cc < size:
+                    inside = 0 <= dr <= 6 and 0 <= dc <= 6
+                    ring = inside and (dr in (0, 6) or dc in (0, 6))
+                    core = inside and 2 <= dr <= 4 and 2 <= dc <= 4
+                    M[rr][cc] = 1 if (ring or core) else 0
+    put_finder(0, 0); put_finder(0, size - 7); put_finder(size - 7, 0)
+    for i in range(8, size - 8):                       # timing
+        v = 1 if i % 2 == 0 else 0
+        if M[6][i] is None: M[6][i] = v
+        if M[i][6] is None: M[i][6] = v
+    ac = _QR_ALIGN[version]                            # alignment (skip the 3 finder corners
+    skip = {(6, 6), (6, ac[-1]) if ac else None, (ac[-1], 6) if ac else None}
+    for r in ac:                                       #  only — patterns MAY sit on timing)
+        for c in ac:
+            if (r, c) in skip:
+                continue
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    M[r + dr][c + dc] = 1 if (max(abs(dr), abs(dc)) in (0, 2)) else 0
+    M[size - 8][8] = 1                                 # dark module
+    fmt_rc = ([(8, c) for c in list(range(0, 6)) + [7, 8]] + [(r, 8) for r in [7] + list(range(5, -1, -1))],
+              [(size - 1 - r, 8) for r in range(7)] + [(8, size - 8 + c) for c in range(8)])
+    for r, c in fmt_rc[0] + fmt_rc[1]:                 # reserve format areas
+        if M[r][c] is None:
+            M[r][c] = 0
+    if version >= 7:                                   # version info
+        vbits = (version << 12) | _bch_remainder(version, 0x1F25, 13, 18)
+        for i in range(18):
+            b = (vbits >> i) & 1
+            M[size - 11 + i % 3][i // 3] = b
+            M[i // 3][size - 11 + i % 3] = b
+    # --- data placement (zigzag), remember which modules are data
+    data_pos = []
+    r, c, up, k = size - 1, size - 1, True, 0
+    while c > 0:
+        if c == 6:
+            c -= 1
+        rng = range(size - 1, -1, -1) if up else range(size)
+        for r in rng:
+            for cc in (c, c - 1):
+                if M[r][cc] is None:
+                    M[r][cc] = int(stream[k]) if k < len(stream) else 0
+                    data_pos.append((r, cc)); k += 1
+        up = not up; c -= 2
+
+    def masked(mask):
+        mm = [row[:] for row in M]
+        for (r, c) in data_pos:
+            if ((r + c) % 2 == 0 if mask == 0 else
+                r % 2 == 0 if mask == 1 else
+                c % 3 == 0 if mask == 2 else
+                (r + c) % 3 == 0 if mask == 3 else
+                (r // 2 + c // 3) % 2 == 0 if mask == 4 else
+                (r * c) % 2 + (r * c) % 3 == 0 if mask == 5 else
+                ((r * c) % 2 + (r * c) % 3) % 2 == 0 if mask == 6 else
+                ((r + c) % 2 + (r * c) % 3) % 2 == 0):
+                mm[r][c] ^= 1
+        fmt = (0b00 << 3) | mask                       # ECC M = '00'
+        f = ((fmt << 10) | _bch_remainder(fmt, 0x537, 11, 15)) ^ 0x5412
+        fb = [(f >> i) & 1 for i in range(14, -1, -1)]
+        coords1 = [(8, 0), (8, 1), (8, 2), (8, 3), (8, 4), (8, 5), (8, 7), (8, 8),
+                   (7, 8), (5, 8), (4, 8), (3, 8), (2, 8), (1, 8), (0, 8)]
+        coords2 = [(size - 1, 8), (size - 2, 8), (size - 3, 8), (size - 4, 8),
+                   (size - 5, 8), (size - 6, 8), (size - 7, 8),
+                   (8, size - 8), (8, size - 7), (8, size - 6), (8, size - 5),
+                   (8, size - 4), (8, size - 3), (8, size - 2), (8, size - 1)]
+        for (rr, cc), b in zip(coords1, fb):
+            mm[rr][cc] = b
+        for (rr, cc), b in zip(coords2, fb):
+            mm[rr][cc] = b
+        return mm
+
+    def penalty(mm):
+        p = 0
+        for rows in (mm, list(map(list, zip(*mm)))):   # N1 rows + cols
+            for row in rows:
+                run, prev = 0, None
+                for v in row + [None]:
+                    if v == prev:
+                        run += 1
+                    else:
+                        if prev is not None and run >= 5:
+                            p += 3 + run - 5
+                        run, prev = 1, v
+        for r in range(size - 1):                      # N2
+            for c in range(size - 1):
+                if mm[r][c] == mm[r][c + 1] == mm[r + 1][c] == mm[r + 1][c + 1]:
+                    p += 3
+        pat1 = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0]
+        pat2 = pat1[::-1]
+        for rows in (mm, list(map(list, zip(*mm)))):   # N3
+            for row in rows:
+                for i in range(size - 10):
+                    seg = row[i:i + 11]
+                    if seg == pat1 or seg == pat2:
+                        p += 40
+        dark = sum(sum(row) for row in mm)             # N4
+        p += 10 * (abs(dark * 100 // (size * size) - 50) // 5)
+        return p
+
+    best = min(range(8), key=lambda m: penalty(masked(m)))
+    return masked(best)
+
+
+def qr_svg(text, scale=6, border=3):
+    """The QR for a piece of text, as a crisp standalone SVG."""
+    M = _qr_matrix(text.encode("utf-8"))
+    n = len(M) + 2 * border
+    cells = "".join(f'<rect x="{c + border}" y="{r + border}" width="1" height="1"/>'
+                    for r, row in enumerate(M) for c, v in enumerate(row) if v)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n} {n}" '
+            f'width="{n * scale}" height="{n * scale}" shape-rendering="crispEdges">'
+            f'<rect width="{n}" height="{n}" fill="#ffffff"/><g fill="#000000">{cells}</g></svg>')
+
+
+# --------------------------------------------------------------------------
 # Web page
 # --------------------------------------------------------------------------
 PAGE = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tastebuds</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/favicon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Tastebuds">
+<meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <style>
   :root{
     --bg:#f5f5f7; --card:#ffffff; --txt:#1d1d1f; --muted:#86868b;
@@ -1559,7 +1869,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="page">
     <div class="topline">
       <div class="tally" id="tally" style="text-align:left"></div>
-      <div class="nightctl"><span class="nlabel">Movie night</span><button class="lswitch" id="night-switch" aria-label="Toggle movie night" title="Movie night: one film for you and your buddies"><span class="knob"></span></button></div>
+      <div class="nightctl"><button class="ghost" id="pair-btn" hidden>Pair a phone</button><span class="nlabel">Movie night</span><button class="lswitch" id="night-switch" aria-label="Toggle movie night" title="Movie night: one film for you and your buddies"><span class="knob"></span></button></div>
     </div>
     <div class="flip-wrap" id="flipwrap">
      <div class="flip" id="flip">
@@ -1838,6 +2148,21 @@ PAGE = r"""<!DOCTYPE html>
         <div class="onb-row"><button class="pbtn cancel" id="onb-rate-back">Back</button><button class="pbtn primary" id="onb-finish">Start rating</button></div>
       </div>
 
+    </div>
+  </div>
+
+  <div class="overlay" id="pair-overlay">
+    <div class="panel" id="pair-panel" style="max-width:430px">
+      <div class="phead"><h2>Tastebuds on your phone</h2><button class="x" id="close-pair">&times;</button></div>
+      <p class="desc">Same Wi-Fi, one scan. Your data stays on this computer — the phone is just
+        another window onto it.</p>
+      <div id="pair-qr" style="display:flex;justify-content:center;margin:14px 0"></div>
+      <div class="note" id="pair-url" style="text-align:center;word-break:break-all"></div>
+      <ol class="desc" style="margin-top:14px;padding-left:20px;line-height:1.8">
+        <li>Scan the code with the phone's camera and open the link.</li>
+        <li>In Safari: <b>Share</b> &rarr; <b>Add to Home Screen</b>.</li>
+        <li>Tastebuds now opens from the phone like any app — as long as this computer is on.</li>
+      </ol>
     </div>
   </div>
 
@@ -2796,6 +3121,21 @@ async function nightPick(){
   btn.textContent='Next pick';
   nightIdx=0; project(nightPicks[0]);
 }
+/* ---- Pair a phone (LAN mode) ---- */
+async function openPair(){
+  document.getElementById('pair-overlay').classList.add('open');
+  const qr=document.getElementById('pair-qr'), u=document.getElementById('pair-url');
+  qr.innerHTML='<div class="note">…</div>';
+  try{
+    const d=await (await fetch('/api/pair')).json();
+    if(d.url){ qr.innerHTML=d.svg; u.textContent=d.url; }
+    else { qr.innerHTML=''; u.textContent='LAN mode is off — start Tastebuds with --lan to pair phones.'; }
+  }catch(e){ u.textContent='Could not load the pairing code.'; }
+}
+document.getElementById('pair-btn').onclick = openPair;
+document.getElementById('close-pair').onclick = ()=>document.getElementById('pair-overlay').classList.remove('open');
+document.getElementById('pair-overlay').onclick = e=>{ if(e.target.id==='pair-overlay') document.getElementById('pair-overlay').classList.remove('open'); };
+
 document.getElementById('night-switch').onclick = nightToggle;
 document.getElementById('night-pick').onclick = nightPick;
 document.getElementById('night-providers').onclick = openProviders;
@@ -2887,6 +3227,7 @@ document.getElementById('onb-overlay').onclick = e=>{ if(e.target.id==='onb-over
 
 (async function boot(){
   let st={}; try{ st=await (await fetch('/api/state')).json(); }catch(e){}
+  document.getElementById('pair-btn').hidden = !st.lan;
   onboardingActive = !!st.needs_onboarding;   // only on a genuinely fresh install
   if(onboardingActive){ onbOpen(!st.has_key); } else { loadNext(); }
   try { recProfile = localStorage.getItem('recProfile') || 'you'; } catch(e){}
@@ -2915,22 +3256,65 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _host_ok(self):
-        # Accept only loopback Host headers. This closes DNS-rebinding: a remote
-        # page can re-point its own hostname at 127.0.0.1, but its requests still
-        # carry Host: that-hostname, so they're rejected here before anything runs
-        # (including serving the page that embeds the token).
+        # Accept only loopback Host headers — or, in LAN mode, our advertised
+        # numeric LAN IP. This closes DNS-rebinding: a remote page can re-point
+        # its own hostname at this machine, but its requests still carry Host:
+        # that-hostname, so they're rejected here before anything runs.
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
-        return host in ("", "127.0.0.1", "localhost", "::1")
+        if host in ("", "127.0.0.1", "localhost", "::1"):
+            return True
+        return LAN_MODE and LAN_IP is not None and host == LAN_IP
+
+    def _is_local_peer(self):
+        return self.client_address[0] in ("127.0.0.1", "::1")
 
     def do_GET(self):
         if not self._host_ok():
             self._send(403, json.dumps({"error": "forbidden"}))
             return
-        if self.path == "/" or self.path.startswith("/index"):
-            self._send(200, PAGE.replace("__CW_TOKEN__", TOKEN), "text/html; charset=utf-8")
+        from urllib.parse import urlparse, parse_qs
+        p = urlparse(self.path)
+        if p.path in ("/", "/index", "/index.html"):
+            if not self._is_local_peer():   # LAN visitors must present the pairing token
+                if parse_qs(p.query).get("t", [""])[0] != TOKEN:
+                    self._send(403, "<html><body style='font-family:sans-serif;padding:40px'>"
+                                    "<h3>Tastebuds</h3><p>This device isn't paired. On the computer "
+                                    "running Tastebuds, open <b>Pair a phone</b> and scan the QR code."
+                                    "</p></body></html>", "text/html; charset=utf-8")
+                    return
+            page = PAGE.replace("__CW_TOKEN__", TOKEN)
+            if not self._is_local_peer():   # phone's manifest link must carry the token
+                page = page.replace('href="/manifest.json"', 'href="/manifest.json?t=%s"' % TOKEN)
+            self._send(200, page, "text/html; charset=utf-8")
+            return
+        if p.path == "/manifest.json":
+            start = "/?t=" + TOKEN if (LAN_MODE and not self._is_local_peer()
+                                       and parse_qs(p.query).get("t", [""])[0] == TOKEN) else "/"
+            self._send(200, json.dumps({
+                "name": "Tastebuds", "short_name": "Tastebuds", "start_url": start,
+                "scope": "/", "display": "standalone",
+                "background_color": "#f5f5f7", "theme_color": "#f5f5f7",
+                "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                          {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}]}),
+                "application/manifest+json")
+            return
+        if p.path in ("/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/favicon.png"):
+            name = {"": None, "/apple-touch-icon.png": "icon-180.png", "/favicon.png": "icon-64.png",
+                    "/icon-192.png": "icon-192.png", "/icon-512.png": "icon-512.png"}[p.path]
+            fp = os.path.join(SCRIPT_DIR, "assets", name)
+            if os.path.exists(fp):
+                with open(fp, "rb") as f:
+                    self._send(200, f.read(), "image/png")
+            else:
+                self._send(404, json.dumps({"error": "no icon"}))
             return
         if self.headers.get("X-Token") != TOKEN:
             self._send(403, json.dumps({"error": "forbidden"}))
+            return
+        if p.path == "/api/pair":
+            u = pair_url()
+            self._send(200, json.dumps({"lan": LAN_MODE, "url": u,
+                                        "svg": qr_svg(u) if u else None}))
             return
         if self.path.startswith("/api/next"):
             from urllib.parse import urlparse, parse_qs
@@ -2964,7 +3348,8 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
             self._send(200, json.dumps({"results": search_keywords(q)}))
         elif self.path.startswith("/api/state"):
-            self._send(200, json.dumps({"needs_onboarding": needs_onboarding(), "has_key": bool(API_KEY)}))
+            self._send(200, json.dumps({"needs_onboarding": needs_onboarding(), "has_key": bool(API_KEY),
+                                        "lan": LAN_MODE}))
         elif self.path.startswith("/api/weights"):
             self._send(200, json.dumps({"weights": load_weights()}))
         elif self.path.startswith("/api/watchlist"):
@@ -3225,13 +3610,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
 
 
-def main():
-    if not API_KEY:
-        print("\n  Note: no TMDb API key found.")
-        print("        Put it in tmdb_key.txt next to this script, or run:")
-        print("          export TMDB_API_KEY=your_key_here")
-        print("        Free key: https://www.themoviedb.org/settings/api")
-        print("        Starting anyway so you can see the UI.\n")
+def create_server(lan=False, port=None):
+    """Prepare data files and return (server, local_url). With lan=True the
+    server binds the whole LAN on a stable port with a persistent pairing
+    token, so phones' home-screen icons keep working across restarts."""
+    global TOKEN, LAN_MODE, LAN_IP, LAN_PORT
     load_channels()  # (fresh installs have none yet; onboarding/UI creates the first)
     # one-time migration: dismissed.md -> not-interested.md (keeps your existing data)
     if not os.path.exists(NOT_INTERESTED_PATH) and os.path.exists(NOT_INTERESTED_LEGACY_PATH):
@@ -3242,11 +3625,37 @@ def main():
     ensure_file(MD_PATH, MOVIES_TEMPLATE)
     ensure_file(WATCHLIST_PATH, WATCHLIST_TEMPLATE)
     ensure_file(NOT_INTERESTED_PATH, NOT_INTERESTED_TEMPLATE)
+    if lan:
+        LAN_MODE = True
+        LAN_IP = lan_ip()
+        LAN_PORT = int(port or LAN_PORT_DEFAULT)
+        TOKEN = persistent_token()
+        server = ThreadingHTTPServer(("0.0.0.0", LAN_PORT), Handler)
+    else:
+        server = ThreadingHTTPServer(("127.0.0.1", int(port or 0)), Handler)
+    local_url = f"http://127.0.0.1:{server.server_address[1]}/"
+    return server, local_url
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    port = server.server_address[1]
-    url = f"http://127.0.0.1:{port}/"
+
+def main():
+    lan = ("--lan" in sys.argv) or os.environ.get("TASTEBUDS_LAN") == "1"
+    port = None
+    if "--port" in sys.argv:
+        try:
+            port = int(sys.argv[sys.argv.index("--port") + 1])
+        except Exception:
+            pass
+    if not API_KEY:
+        print("\n  Note: no TMDb API key found.")
+        print("        Put it in tmdb_key.txt next to this script, or run:")
+        print("          export TMDB_API_KEY=your_key_here")
+        print("        Free key: https://www.themoviedb.org/settings/api")
+        print("        Starting anyway so you can see the UI.\n")
+    server, url = create_server(lan=lan, port=port)
     print(f"  Rating UI running at {url}")
+    if lan:
+        print(f"  LAN pairing on:      {pair_url()}")
+        print("  (open 'Pair a phone' in the UI for a QR code)")
     print("  (a browser tab should open; press Ctrl+C here to stop)\n")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

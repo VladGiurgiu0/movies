@@ -42,7 +42,7 @@ from datetime import date
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.abspath(__file__))   # where the CODE lives
 ROOT = os.path.dirname(HERE)
 for p in (HERE, ROOT):
     if p not in sys.path:
@@ -54,16 +54,24 @@ try:
 except Exception:
     rater = None
 
-MOVIES = os.path.join(ROOT, "movies.md")
-WATCH = os.path.join(ROOT, "watchlist.md")
-NOT_INTERESTED = os.path.join(ROOT, "not-interested.md")
-NOT_INTERESTED_LEGACY = os.path.join(ROOT, "dismissed.md")  # pre-rename fallback
-CACHE = os.path.join(HERE, "features_cache.json")
-MODEL_PATH = os.path.join(HERE, "model.json")
-OUT = os.path.join(HERE, "recommendations.md")
-FRIENDS_PATH = os.path.join(ROOT, "friends.json")   # multi-friend list [{name, likes}]
-FRIEND_PATH = os.path.join(ROOT, "friend.json")     # legacy single-friend file
-WEIGHTS_PATH = os.path.join(ROOT, "model_weights.json")   # user's per-reaction training weights
+# Where the DATA lives — same folders as the code by default; a packaged app
+# sets TASTEBUDS_HOME (see tastebuds.py) and everything writable follows it.
+_HOME = os.environ.get("TASTEBUDS_HOME")
+DATA_ROOT = os.path.abspath(os.path.expanduser(_HOME)) if _HOME else ROOT
+CACHE_DIR = os.path.join(DATA_ROOT, "ml-recommender") if _HOME else HERE
+if _HOME:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+MOVIES = os.path.join(DATA_ROOT, "movies.md")
+WATCH = os.path.join(DATA_ROOT, "watchlist.md")
+NOT_INTERESTED = os.path.join(DATA_ROOT, "not-interested.md")
+NOT_INTERESTED_LEGACY = os.path.join(DATA_ROOT, "dismissed.md")  # pre-rename fallback
+CACHE = os.path.join(CACHE_DIR, "features_cache.json")
+MODEL_PATH = os.path.join(CACHE_DIR, "model.json")
+OUT = os.path.join(CACHE_DIR, "recommendations.md")
+FRIENDS_PATH = os.path.join(DATA_ROOT, "friends.json")   # multi-friend list [{name, likes}]
+FRIEND_PATH = os.path.join(DATA_ROOT, "friend.json")     # legacy single-friend file
+WEIGHTS_PATH = os.path.join(DATA_ROOT, "model_weights.json")   # user's per-reaction training weights
 
 # How strongly each reaction trains the model (strength only; direction is fixed
 # by the reaction: Liked pulls toward, the rest push away). Editable in the UI.
@@ -885,7 +893,7 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
 # MINIMUM over participants: least misery (O'Connor et al., PolyLens 2001).
 # Nobody's evening gets sacrificed for the mean.
 # --------------------------------------------------------------------------
-PROVIDERS_CACHE = os.path.join(HERE, "providers_cache.json")
+PROVIDERS_CACHE = os.path.join(CACHE_DIR, "providers_cache.json")
 PROVIDERS_TTL = 7 * 86400   # availability moves slowly; re-check weekly
 
 

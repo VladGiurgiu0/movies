@@ -1,6 +1,14 @@
 # --- Secrets: never commit your API key ---
 tmdb_key.txt
 .env
+lan_token.txt
+app.log
+
+# --- App build artifacts (built locally with `make app`) ---
+build/
+dist/
+*.dmg
+assets/icon.icns
 
 # --- Personal data: keep your own ratings/watchlist private ---
 movies.md

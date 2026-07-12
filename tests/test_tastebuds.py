@@ -399,6 +399,49 @@ class TestWeights(unittest.TestCase):
         self.assertIn("notint", tb.stats())
 
 
+class TestQREncoder(unittest.TestCase):
+    """The stdlib QR encoder behind 'Pair a phone'."""
+
+    def test_reed_solomon_known_vector(self):
+        # the classic HELLO WORLD v1-Q tutorial vector
+        data = [32, 91, 11, 120, 209, 114, 220, 77, 67, 64, 236, 17, 236, 17, 236, 17]
+        self.assertEqual(tb._rs_ecc(data, 10),
+                         [196, 35, 39, 119, 235, 215, 231, 226, 93, 23])
+
+    def test_format_and_version_bch_known_vectors(self):
+        f = ((0b01000 << 10) | tb._bch_remainder(0b01000, 0x537, 11, 15)) ^ 0x5412
+        self.assertEqual(format(f, "015b"), "111011111000100")     # ECC-L, mask 0
+        f = ((0b00000 << 10) | tb._bch_remainder(0b00000, 0x537, 11, 15)) ^ 0x5412
+        self.assertEqual(format(f, "015b"), "101010000010010")     # ECC-M, mask 0
+        vi = (7 << 12) | tb._bch_remainder(7, 0x1F25, 13, 18)
+        self.assertEqual(format(vi, "018b"), "000111110010010100")  # version 7 info
+
+    def test_pairing_urls_decode(self):
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            self.skipTest("OpenCV not installed")
+        det = cv2.QRCodeDetector()
+        for t in ("http://192.168.1.23:8765/?t=" + "0123456789abcdef" * 2,
+                  "http://10.0.0.5:8765/?t=" + "f" * 32):
+            M = tb._qr_matrix(t.encode())
+            n, scale, border = len(M), 10, 4
+            img = np.full(((n + 2 * border) * scale,) * 2, 255, np.uint8)
+            for r in range(n):
+                for c in range(n):
+                    if M[r][c]:
+                        img[(r + border) * scale:(r + border + 1) * scale,
+                            (c + border) * scale:(c + border + 1) * scale] = 0
+            decoded, _, _ = det.detectAndDecode(img)
+            self.assertEqual(decoded, t)
+
+    def test_svg_shape(self):
+        svg = tb.qr_svg("http://192.168.0.2:8765/?t=" + "a" * 32)
+        self.assertTrue(svg.startswith("<svg") and svg.endswith("</svg>"))
+        self.assertIn("crispEdges", svg)
+
+
 WATCHLIST_SAMPLE_MD = (
     "# Watchlist\n\n<!-- TABLE-START -->\n\n"
     "| Title | Year | Genres | TMDb ID | Link | Added on |\n"
@@ -420,14 +463,14 @@ class TestShareExport(unittest.TestCase):
                 f.write(text)
             return p
 
-        self._orig = (tb.MD_PATH, tb.WATCHLIST_PATH, tb.NOT_INTERESTED_PATH, tb.ML_DIR)
+        self._orig = (tb.MD_PATH, tb.WATCHLIST_PATH, tb.NOT_INTERESTED_PATH, tb.ML_DATA_DIR)
         tb.MD_PATH = w("movies.md", MOVIES_MD)
         tb.WATCHLIST_PATH = w("watchlist.md", WATCHLIST_SAMPLE_MD)
         tb.NOT_INTERESTED_PATH = w("not-interested.md", NOT_INTERESTED_OLD_MD)
-        tb.ML_DIR = self.tmp          # model.json (if any) lives here during the test
+        tb.ML_DATA_DIR = self.tmp     # model.json (if any) lives here during the test
 
     def tearDown(self):
-        (tb.MD_PATH, tb.WATCHLIST_PATH, tb.NOT_INTERESTED_PATH, tb.ML_DIR) = self._orig
+        (tb.MD_PATH, tb.WATCHLIST_PATH, tb.NOT_INTERESTED_PATH, tb.ML_DATA_DIR) = self._orig
 
     def test_payload_shape_and_seen_ids(self):
         s = tb.share_export()

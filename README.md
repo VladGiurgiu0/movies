@@ -20,6 +20,37 @@ by [The Movie Database (TMDb)](https://www.themoviedb.org). The rater itself use
 only the Python standard library; the optional recommender adds a single
 dependency (NumPy).
 
+## Get started
+
+**On a Mac — two double-clicks, no terminal.**
+
+1. Get the code: **Code → Download ZIP** on GitHub (unzip it anywhere you like),
+   or `git clone https://github.com/VladGiurgiu0/movies.git`.
+2. In the folder, double-click **`Install Tastebuds.command`**. It checks Python
+   (macOS offers to install its own if missing), sets up the recommender, and puts
+   **Tastebuds — with its own icon — in ~/Applications**, then opens it. If macOS
+   warns about an unidentified developer (ZIP downloads), right-click the file and
+   choose **Open**, once.
+3. Done. From now on it launches like any app — Spotlight, Launchpad, or the Dock.
+   Prefer not to install? Double-click **`Start Tastebuds.command`** instead to
+   run it straight from the folder.
+
+**Anywhere else (or if you like terminals):**
+
+```bash
+git clone https://github.com/VladGiurgiu0/movies.git
+cd movies
+python3 tastebuds.py
+```
+
+**First run:** a short in-app setup asks for a free TMDb key (guided, about two
+minutes — see [Get your own TMDb API key](#get-your-own-tmdb-api-key)) and helps
+you build your first channel from a film you love. There is nothing to configure
+up front, and everything the app writes stays in plain files you own.
+
+**On your phone or tablet:** one QR scan — see
+[On your phone or tablet](#on-your-phone-or-tablet-home-wi-fi).
+
 ## Features
 
 - **One-at-a-time rating** with a clean, minimal UI (automatic light/dark),
@@ -138,8 +169,54 @@ python3 tastebuds.py
 
 A browser tab opens automatically. **The first time**, a short setup walks you
 through your key and your first channel; after that you go straight to rating.
+To keep your data in a different folder than the code, set `TASTEBUDS_HOME`
+(e.g. `export TASTEBUDS_HOME=~/Tastebuds`) — everything you own (ratings,
+watchlist, key, caches, model) follows it.
 Press `Ctrl+C` in the terminal to stop. Your ratings are written to `movies.md`
 and saved titles to `watchlist.md` (both created automatically).
+
+## On your phone or tablet (home Wi-Fi)
+
+Start Tastebuds in LAN mode and pair any phone or tablet in the house:
+
+```bash
+python3 tastebuds.py --lan
+```
+
+Then click **Pair a phone** (top right, next to the Movie night switch), scan
+the QR code with the phone's camera, and in Safari choose **Share → Add to Home
+Screen**. Tastebuds now opens from the phone like an app — same data, same
+model, served by your computer. The pairing link uses a private token that
+stays stable across restarts, so the home-screen icon keeps working; devices
+without the token only ever see a "not paired" page, and the data API stays
+locked regardless. Your films never leave the house.
+
+## The macOS app — details
+
+The installer from [Get started](#get-started) is an ordinary, readable shell
+script: it checks Python, installs NumPy (and tries pywebview, for a native
+window — without it the app opens in your browser, which works just as well),
+creates your data folder at `~/Tastebuds`, and assembles the app in
+`~/Applications`. **Run it again anytime** — it only refreshes what's there.
+
+The app behaves like a proper Mac citizen: the window's **close button hides
+it into the Dock** while the server keeps running — so a paired phone or
+tablet stays connected. Click the Dock icon to bring the window back; quit
+for real with **Cmd+Q** (or right-click the Dock icon → Quit). Launching the
+app while it's already running simply opens the running one.
+Your data is never touched by installing or updating: it lives in plain files
+in `~/Tastebuds` (or next to the code, if you started that way).
+
+For a fully self-contained `Tastebuds.app` you can hand to someone *without*
+the repo, there's also a PyInstaller build:
+
+```bash
+pip install pyinstaller pywebview numpy
+make app          # builds dist/Tastebuds.app
+```
+
+Unsigned builds need one right-click → Open on first launch (Gatekeeper). See
+the `Makefile` for .dmg packaging and notarization notes.
 
 ## Channels
 
