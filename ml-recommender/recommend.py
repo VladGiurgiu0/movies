@@ -54,12 +54,20 @@ try:
 except Exception:
     rater = None
 
-# Where the DATA lives — same folders as the code by default; a packaged app
-# sets TASTEBUDS_HOME (see tastebuds.py) and everything writable follows it.
+# Where the DATA lives — the same rule as tastebuds.py, so terminal, app, and
+# recommender always agree: explicit TASTEBUDS_HOME > a library already beside
+# the code (legacy) > a tidy ~/Tastebuds for fresh setups.
 _HOME = os.environ.get("TASTEBUDS_HOME")
-DATA_ROOT = os.path.abspath(os.path.expanduser(_HOME)) if _HOME else ROOT
-CACHE_DIR = os.path.join(DATA_ROOT, "ml-recommender") if _HOME else HERE
 if _HOME:
+    DATA_ROOT = os.path.abspath(os.path.expanduser(_HOME))
+elif os.path.exists(os.path.join(ROOT, "movies.md")):
+    DATA_ROOT = ROOT
+else:
+    DATA_ROOT = os.path.expanduser("~/Tastebuds")
+CACHE_DIR = HERE if DATA_ROOT == ROOT else os.path.join(DATA_ROOT, "ml-recommender")
+
+
+def _ensure_cache_dir():
     os.makedirs(CACHE_DIR, exist_ok=True)
 
 MOVIES = os.path.join(DATA_ROOT, "movies.md")
@@ -681,6 +689,7 @@ def run(n=15, source="discover", offline=False, train_only=False, explore=0.0,
     # profile is "you" (your taste) or a friend's name. exclude_ids = films already
     # shown this session, so a fresh Recommend batch never repeats them.
     # model_pref: "auto" (CV gate decides) or a forced "similarity"/"linear"/"fm".
+    _ensure_cache_dir()
     model_pref = model_pref if model_pref in MODEL_PREFS else "auto"
     exclude_ids = set(exclude_ids or [])
     is_friend = profile != "you"
@@ -1023,6 +1032,7 @@ MISERY_FLOOR = 0.25   # avg_no_misery: a film under this percentile for anyone i
 
 def movie_night(party, n=8, offline=False, combine="least_misery", model_pref="auto"):
     """Pick films for the group: you + the named imported friends."""
+    _ensure_cache_dir()
     combine = combine if combine in COMBINE_OPS else "least_misery"
     model_pref = model_pref if model_pref in MODEL_PREFS else "auto"
     movies = load_movies()

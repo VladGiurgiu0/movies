@@ -91,19 +91,107 @@ def main():
         server.shutdown()
         return
 
-    window = webview.create_window("Tastebuds", url, width=940, height=1000)
-    state = {"dock": False, "hidden": False, "observer": None}
+    width, height = 940, 1000
+    if sys.platform == "darwin":
+        try:                          # fit the visible screen, don't overflow it
+            from AppKit import NSScreen
+            vf = NSScreen.mainScreen().visibleFrame()
+            height = min(1080, int(vf.size.height) - 20)
+            width = min(940, int(vf.size.width) - 60)
+        except Exception as e:
+            log("screen size lookup failed: %s" % e)
+    window = webview.create_window("Tastebuds", url, width=width, height=height,
+                                   min_size=(680, 620))
+    log("window %dx%d" % (width, height))
+    state = {"dock": False, "hidden": False, "quitting": False,
+             "observer": None, "monitor": None, "term_obs": None, "watchdog": False}
+
+    def arm_quit_watchdog():
+        """Once quitting starts, the process WILL exit — politely if Cocoa
+        cooperates, hard if it doesn't. No more force-quitting, ever."""
+        if state["watchdog"]:
+            return
+        state["watchdog"] = True
+
+        def hard_exit():
+            log("watchdog: still alive — hard exit")
+            os._exit(0)               # atomic writes are already on disk
+
+        t = threading.Timer(5.0, hard_exit)   # room for the fullscreen animation
+        t.daemon = True
+        t.start()
+
+    def fullscreen_nswindows():
+        if sys.platform != "darwin":
+            return []
+        try:
+            from AppKit import NSApplication
+            return [w for w in (NSApplication.sharedApplication().windows() or [])
+                    if int(w.styleMask()) & (1 << 14)]    # NSWindowStyleMaskFullScreen
+        except Exception:
+            return []
+
+    def exit_fullscreen_then(then, label):
+        """Quitting or hiding straight out of a fullscreen Space leaves the
+        screen black — leave fullscreen first (main thread), act afterwards."""
+        fs = fullscreen_nswindows()
+        delay = 0.05
+        if fs:
+            log("leaving fullscreen before %s" % label)
+            delay = 1.0               # let the Space animation finish
+            try:
+                from Foundation import NSOperationQueue
+
+                def toggle():
+                    for w in fs:
+                        try:
+                            w.toggleFullScreen_(None)
+                        except Exception as e:
+                            log("toggleFullScreen failed: %s" % e)
+
+                NSOperationQueue.mainQueue().addOperationWithBlock_(toggle)
+            except Exception as e:
+                log("fullscreen exit dispatch failed: %s" % e)
+        t = threading.Timer(delay, then)      # always off the event-handler stack
+        t.daemon = True
+        t.start()
+
+    def really_quit(source):
+        log("quit requested via %s" % source)
+        state["quitting"] = True
+        arm_quit_watchdog()
+
+        def teardown():
+            try:
+                window.destroy()
+                log("window destroyed")
+            except Exception as e:
+                log("destroy failed: %s" % e)
+            def terminate():
+                try:
+                    from AppKit import NSApplication
+                    NSApplication.sharedApplication().terminate_(None)
+                except Exception as e:
+                    log("terminate failed: %s" % e)
+            t2 = threading.Timer(1.2, terminate)
+            t2.daemon = True
+            t2.start()
+
+        exit_fullscreen_then(teardown, "quit")
 
     def bind_mac_lifecycle():
-        """Dock-reopen without touching pywebview's internals: observe the app's
-        'did become active' notification (fires when the Dock icon is clicked or
-        the app is Cmd+Tabbed to) and re-show the window if we hid it. Only when
-        this observer is in place does the close button switch to hide-mode —
-        so a failed hook can never strand a hidden window."""
+        """Mac manners without touching pywebview's internals:
+        - 'did become active' observer re-shows a hidden window (Dock click);
+        - a local Cmd+Q key monitor quits FOR REAL (sets the quitting flag so
+          the closing handler lets go);
+        - a will-terminate observer marks any other quit path as real, too.
+        Hide-on-close only activates once the observer is bound, so a failed
+        hook can never strand a hidden window."""
         if sys.platform != "darwin":
             log("not macOS — close quits")
             return
         try:
+            from AppKit import NSEvent, NSApplication
             from Foundation import NSNotificationCenter, NSOperationQueue
 
             def on_activate(_note):
@@ -115,23 +203,62 @@ def main():
                     except Exception as e:
                         log("show failed: %s" % e)
 
-            state["observer"] = NSNotificationCenter.defaultCenter() \
-                .addObserverForName_object_queue_usingBlock_(
-                    "NSApplicationDidBecomeActiveNotification", None,
-                    NSOperationQueue.mainQueue(), on_activate)
+            center = NSNotificationCenter.defaultCenter()
+            state["observer"] = center.addObserverForName_object_queue_usingBlock_(
+                "NSApplicationDidBecomeActiveNotification", None,
+                NSOperationQueue.mainQueue(), on_activate)
+
+            def on_terminate(_note):
+                log("app will terminate")
+                state["quitting"] = True
+                arm_quit_watchdog()
+
+            state["term_obs"] = center.addObserverForName_object_queue_usingBlock_(
+                "NSApplicationWillTerminateNotification", None,
+                NSOperationQueue.mainQueue(), on_terminate)
+
+            def key_handler(event):
+                try:                  # Cmd+Q = 1<<20 command flag, 'q'
+                    if (event.modifierFlags() & (1 << 20)) and \
+                       (event.charactersIgnoringModifiers() or "").lower() == "q":
+                        really_quit("cmd+q")   # async — never from inside the event stack
+                        return None            # swallow the keystroke
+                except Exception as e:
+                    log("key handler error: %s" % e)
+                return event
+
+            def install_monitor():
+                state["monitor"] = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    1 << 10, key_handler)          # key-down events
+                log("cmd+q monitor installed")
+
+            NSOperationQueue.mainQueue().addOperationWithBlock_(install_monitor)
             state["dock"] = True
-            log("dock hook bound — close hides, Dock reopens")
+            log("dock hook bound — close hides, Dock reopens, Cmd+Q quits")
         except Exception as e:
             log("dock hook FAILED (%s) — close quits, as before" % e)
 
     def on_closing():
+        if state["quitting"]:
+            log("closing allowed — quit in progress")
+            return True
+        if state["hidden"]:
+            # a hidden window has no close button: this is app termination
+            log("close requested while hidden — allowing quit")
+            state["quitting"] = True
+            arm_quit_watchdog()
+            return True
         if state["dock"]:
             log("close button — hiding to Dock, server keeps serving")
             state["hidden"] = True
-            try:
-                window.hide()
-            except Exception as e:
-                log("hide failed: %s" % e)
+
+            def do_hide():
+                try:
+                    window.hide()
+                except Exception as e:
+                    log("hide failed: %s" % e)
+
+            exit_fullscreen_then(do_hide, "hide")   # windowed first, then hide
             return False              # cancel the real close
         log("close button — quitting (no dock hook)")
         return True

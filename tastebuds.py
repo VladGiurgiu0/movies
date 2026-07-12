@@ -59,13 +59,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # Config / paths
 # --------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # where the CODE lives
-# Where the DATA lives. Normally the same folder (run from a clone, everything
-# sits together, git-ignored). A packaged app sets TASTEBUDS_HOME to a normal
-# user folder (e.g. ~/Tastebuds) so your files stay visible, editable, and
-# outside any app bundle — you own your data, wherever the code runs from.
-DATA_DIR = os.path.abspath(os.path.expanduser(os.environ.get("TASTEBUDS_HOME") or SCRIPT_DIR))
-if DATA_DIR != SCRIPT_DIR:
-    os.makedirs(DATA_DIR, exist_ok=True)
+# Where the DATA lives — one rule everywhere (terminal, app, recommender):
+#   1. an explicit TASTEBUDS_HOME always wins;
+#   2. else a library already sitting next to the code keeps working (legacy);
+#   3. else — fresh setups — a tidy ~/Tastebuds, so the clone stays clean code.
+# Either way your files are plain and visible; you own them.
+_home_env = os.environ.get("TASTEBUDS_HOME")
+if _home_env:
+    DATA_DIR = os.path.abspath(os.path.expanduser(_home_env))
+elif os.path.exists(os.path.join(SCRIPT_DIR, "movies.md")):
+    DATA_DIR = SCRIPT_DIR
+else:
+    DATA_DIR = os.path.expanduser("~/Tastebuds")
 MD_PATH = os.path.join(DATA_DIR, "movies.md")
 WATCHLIST_PATH = os.path.join(DATA_DIR, "watchlist.md")
 NOT_INTERESTED_PATH = os.path.join(DATA_DIR, "not-interested.md")
@@ -1044,6 +1049,27 @@ def _poster_cached(movie_id):
     """Poster URL from the cache only (no network); None if not cached or none exists."""
     p = _posters().get(str(movie_id))
     return (IMG_BASE + p) if p else None
+
+
+_details_cache = {}
+def fetch_details(movie_id):
+    """Poster + synopsis for one film, cache-first. Fills in candidates that
+    arrive bare — e.g. recommendations sourced from your 0-shortlist when the
+    discover pool runs dry late in a session."""
+    if movie_id in _details_cache:
+        return _details_cache[movie_id]
+    out = {"poster": _poster_cached(movie_id), "overview": ""}
+    if API_KEY:
+        try:
+            d = tmdb_get(f"movie/{movie_id}", {"language": LANGUAGE})
+            p = d.get("poster_path")
+            if p:
+                out["poster"] = IMG_BASE + p
+            out["overview"] = d.get("overview") or ""
+        except Exception:
+            pass
+    _details_cache[movie_id] = out
+    return out
 
 
 def fetch_poster(movie_id):
@@ -2647,6 +2673,18 @@ function renderRecMovie(m){
      '<button class="btn skip"  onclick="recNotInterested()">Not interested</button>'+
      '<button class="btn watch" onclick="recWatch()">Add to Watchlist</button>'+
    '</div>';
+  if((!m.poster || !m.overview) && m.id){
+    // shortlist-sourced candidates arrive bare — fill poster + synopsis lazily
+    fetch('/api/details?id='+m.id).then(r=>r.json()).then(d=>{
+      if(recCurrent!==m) return;
+      if(d.poster && !m.poster){ m.poster=d.poster;
+        const ph=b.querySelector('.poster');
+        if(ph && ph.tagName!=='IMG'){ const img=document.createElement('img'); img.className='poster';
+          img.alt='poster'; img.src=d.poster; ph.replaceWith(img); } }
+      if(d.overview && !m.overview){ m.overview=d.overview;
+        const ov=b.querySelector('.overview'); if(ov) ov.textContent=d.overview; }
+    }).catch(()=>{});
+  }
 }
 async function advanceRec(){
   const b = document.getElementById('rec-body');
@@ -3363,6 +3401,11 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import urlparse, parse_qs
             pid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
             self._send(200, json.dumps({"poster": fetch_poster(int(pid)) if pid.isdigit() else None}))
+        elif self.path.startswith("/api/details"):
+            from urllib.parse import urlparse, parse_qs
+            pid = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            self._send(200, json.dumps(fetch_details(int(pid)) if pid.isdigit()
+                                       else {"poster": None, "overview": ""}))
         elif self.path.startswith("/api/likes"):
             self._send(200, json.dumps({"likes": liked_export()}))
         elif self.path.startswith("/api/share"):
@@ -3615,6 +3658,7 @@ def create_server(lan=False, port=None):
     server binds the whole LAN on a stable port with a persistent pairing
     token, so phones' home-screen icons keep working across restarts."""
     global TOKEN, LAN_MODE, LAN_IP, LAN_PORT
+    os.makedirs(DATA_DIR, exist_ok=True)
     load_channels()  # (fresh installs have none yet; onboarding/UI creates the first)
     # one-time migration: dismissed.md -> not-interested.md (keeps your existing data)
     if not os.path.exists(NOT_INTERESTED_PATH) and os.path.exists(NOT_INTERESTED_LEGACY_PATH):

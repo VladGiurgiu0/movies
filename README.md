@@ -169,11 +169,15 @@ python3 tastebuds.py
 
 A browser tab opens automatically. **The first time**, a short setup walks you
 through your key and your first channel; after that you go straight to rating.
-To keep your data in a different folder than the code, set `TASTEBUDS_HOME`
-(e.g. `export TASTEBUDS_HOME=~/Tastebuds`) — everything you own (ratings,
-watchlist, key, caches, model) follows it.
-Press `Ctrl+C` in the terminal to stop. Your ratings are written to `movies.md`
-and saved titles to `watchlist.md` (both created automatically).
+Press `Ctrl+C` in the terminal to stop.
+
+**Where your data lives** — one rule everywhere (terminal, app, recommender):
+an explicit `TASTEBUDS_HOME` environment variable always wins; otherwise a
+library already sitting next to the code keeps working as-is; otherwise —
+every fresh setup — everything goes to a tidy **`~/Tastebuds`** folder, so the
+code folder stays clean. Either way your ratings are in `movies.md`, saved
+titles in `watchlist.md`, and every file is plain text you can open, back up,
+or move (move the folder + set `TASTEBUDS_HOME`, and everything follows).
 
 ## On your phone or tablet (home Wi-Fi)
 
