@@ -1202,6 +1202,7 @@ def run_recommender(extra_args, timeout=600):
 # --------------------------------------------------------------------------
 LAN_MODE = False
 LAN_IP = None
+LAN_HOST = None      # Bonjour .local name — the stable way to reach this machine
 LAN_PORT = None
 LAN_PORT_DEFAULT = 8765
 LAN_TOKEN_PATH = os.path.join(DATA_DIR, "lan_token.txt")
@@ -1218,6 +1219,35 @@ def lan_ip():
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def lan_hostname():
+    """This machine's Bonjour (.local) name — pairing against the NAME means
+    home-screen icons survive IP changes. On macOS the authoritative source is
+    `scutil --get LocalHostName` (socket.gethostname() often returns a
+    router-assigned name like something.fritz.box, which is NOT resolvable as
+    .local). The name is only advertised if it actually resolves here;
+    otherwise pairing falls back to the numeric IP."""
+    import socket
+    name = None
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(["scutil", "--get", "LocalHostName"],
+                               capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                name = r.stdout.strip()
+        except Exception:
+            pass
+    if not name:
+        name = (socket.gethostname() or "").split(".")[0].strip()
+    if not name or name.lower() == "localhost":
+        return None
+    host = name.lower() + ".local"
+    try:
+        socket.getaddrinfo(host, None)   # advertise only what resolves
+    except Exception:
+        return None
+    return host
 
 
 def persistent_token():
@@ -1238,6 +1268,15 @@ def persistent_token():
 
 
 def pair_url():
+    """The QR's URL: the .local name when available (stable), else the IP."""
+    if not LAN_MODE:
+        return None
+    host = LAN_HOST or LAN_IP
+    return f"http://{host}:{LAN_PORT}/?t={TOKEN}"
+
+
+def pair_url_ip():
+    """Numeric-address fallback (some non-Apple devices don't resolve .local)."""
     return f"http://{LAN_IP}:{LAN_PORT}/?t={TOKEN}" if LAN_MODE else None
 
 
@@ -3166,7 +3205,10 @@ async function openPair(){
   qr.innerHTML='<div class="note">…</div>';
   try{
     const d=await (await fetch('/api/pair')).json();
-    if(d.url){ qr.innerHTML=d.svg; u.textContent=d.url; }
+    if(d.url){
+      qr.innerHTML=d.svg;
+      u.innerHTML=esc(d.url)+(d.alt?('<br><span style="opacity:.65">not opening? try '+esc(d.alt)+'</span>'):'');
+    }
     else { qr.innerHTML=''; u.textContent='LAN mode is off — start Tastebuds with --lan to pair phones.'; }
   }catch(e){ u.textContent='Could not load the pairing code.'; }
 }
@@ -3301,7 +3343,7 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
         if host in ("", "127.0.0.1", "localhost", "::1"):
             return True
-        return LAN_MODE and LAN_IP is not None and host == LAN_IP
+        return LAN_MODE and host in {h for h in (LAN_IP, LAN_HOST) if h}
 
     def _is_local_peer(self):
         return self.client_address[0] in ("127.0.0.1", "::1")
@@ -3350,8 +3392,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, json.dumps({"error": "forbidden"}))
             return
         if p.path == "/api/pair":
-            u = pair_url()
+            u, ui = pair_url(), pair_url_ip()
             self._send(200, json.dumps({"lan": LAN_MODE, "url": u,
+                                        "alt": ui if (u and ui != u) else None,
                                         "svg": qr_svg(u) if u else None}))
             return
         if self.path.startswith("/api/next"):
@@ -3657,7 +3700,7 @@ def create_server(lan=False, port=None):
     """Prepare data files and return (server, local_url). With lan=True the
     server binds the whole LAN on a stable port with a persistent pairing
     token, so phones' home-screen icons keep working across restarts."""
-    global TOKEN, LAN_MODE, LAN_IP, LAN_PORT
+    global TOKEN, LAN_MODE, LAN_IP, LAN_HOST, LAN_PORT
     os.makedirs(DATA_DIR, exist_ok=True)
     load_channels()  # (fresh installs have none yet; onboarding/UI creates the first)
     # one-time migration: dismissed.md -> not-interested.md (keeps your existing data)
@@ -3672,6 +3715,7 @@ def create_server(lan=False, port=None):
     if lan:
         LAN_MODE = True
         LAN_IP = lan_ip()
+        LAN_HOST = lan_hostname()
         LAN_PORT = int(port or LAN_PORT_DEFAULT)
         TOKEN = persistent_token()
         server = ThreadingHTTPServer(("0.0.0.0", LAN_PORT), Handler)

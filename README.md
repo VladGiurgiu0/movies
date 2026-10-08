@@ -190,10 +190,14 @@ python3 tastebuds.py --lan
 Then click **Pair a phone** (top right, next to the Movie night switch), scan
 the QR code with the phone's camera, and in Safari choose **Share → Add to Home
 Screen**. Tastebuds now opens from the phone like an app — same data, same
-model, served by your computer. The pairing link uses a private token that
-stays stable across restarts, so the home-screen icon keeps working; devices
-without the token only ever see a "not paired" page, and the data API stays
-locked regardless. Your films never leave the house.
+model, served by your computer. The pairing link uses your computer's Bonjour
+name (`your-mac.local`) plus a private token that stays stable across
+restarts — so the home-screen icon survives router-assigned IP changes, and
+even a move to a different Wi-Fi as long as phone and computer are on the
+same network. (Both devices must always share a network: nothing is relayed
+through any cloud.) Devices without the token only ever see a "not paired"
+page, and the data API stays locked regardless. Your films never leave the
+house.
 
 ## The macOS app — details
 
