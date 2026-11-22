@@ -649,7 +649,14 @@ def _atomic_write(path, text):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, path)
+        for i in range(8):            # Windows can lock the target for a moment
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if i == 7:
+                    raise
+                time.sleep(0.05 * (i + 1))
     except Exception:
         try:
             os.remove(tmp)

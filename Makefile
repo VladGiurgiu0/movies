@@ -4,6 +4,10 @@
 #   make icns    build assets/icon.icns from the iconset PNGs (macOS iconutil)
 #   make dmg     wrap dist/Tastebuds.app into a distributable .dmg (needs: brew install create-dmg)
 #   make clean   remove build artifacts
+#   make selftest  check the built app headlessly (server, page, NumPy, recommender)
+#
+# Releases for friends (macOS + Windows) are built by GitHub instead — push a
+# version tag; see .github/workflows/release.yml and the README.
 #
 # Distribution notes:
 # - Unsigned builds: recipients right-click the app -> Open (once) to pass Gatekeeper.
@@ -12,7 +16,7 @@
 #     xcrun notarytool submit Tastebuds.dmg --keychain-profile PROFILE --wait
 #     xcrun stapler staple Tastebuds.dmg
 
-.PHONY: app icns dmg clean
+.PHONY: app icns dmg clean selftest
 
 app: icns
 	cd app && pyinstaller --noconfirm tastebuds.spec --distpath ../dist --workpath ../build
@@ -26,5 +30,8 @@ dmg:
 	  --window-size 600 300 --icon "Tastebuds.app" 150 120 \
 	  Tastebuds.dmg dist/Tastebuds.app
 
+selftest:
+	dist/Tastebuds.app/Contents/MacOS/Tastebuds --selftest
+
 clean:
-	rm -rf build dist app/build app/dist Tastebuds.dmg
+	rm -rf build dist app/build app/dist Tastebuds.dmg dmg wheels

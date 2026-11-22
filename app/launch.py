@@ -4,8 +4,12 @@
 Run directly (python3 app/launch.py) or via the installed Tastebuds.app.
 The app is a thin wrapper around this file, so code changes apply on the next
 launch — no reinstall needed. Your data lives in ~/Tastebuds (override with
-TASTEBUDS_HOME) — or next to the code if a library already sits there. LAN
-pairing is on by default (TASTEBUDS_LAN=0 turns it off).
+TASTEBUDS_HOME) — or next to the code if a library already sits there.
+Phone pairing is off until switched on in "Pair a phone" (TASTEBUDS_LAN=1
+turns it on from the start, as before).
+
+Windows and Linux: the close button quits (normal manners there).
+`--selftest` runs a headless health check of the build and exits (CI uses it).
 
 macOS lifecycle: the window's close button HIDES the window — the app stays in
 the Dock and the server keeps serving your paired phone or tablet. Click the
@@ -23,6 +27,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# A windowed build (Windows/macOS) has no console: give stray prints somewhere
+# harmless to go instead of None.
+for _name in ("stdout", "stderr"):
+    if getattr(sys, _name) is None:
+        setattr(sys, _name, open(os.devnull, "w"))
+
+SELFTEST = "--selftest" in sys.argv
+if SELFTEST:   # build check: throwaway data folder, recommender in-process, no window
+    import tempfile
+    os.environ["TASTEBUDS_HOME"] = tempfile.mkdtemp(prefix="tastebuds-selftest-")
+    os.environ["TASTEBUDS_INPROC"] = "1"
 
 # Data folder: an explicit TASTEBUDS_HOME wins; otherwise, if this clone already
 # holds a library next to the code (the classic run-from-the-repo setup), keep
@@ -43,6 +59,19 @@ def log(msg):
         pass
 
 
+def port_in_use(port):
+    """Fast local probe (Windows takes ~2 s to report a refused connection)."""
+    import socket
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
 def existing_tastebuds(port):
     """Is another Tastebuds already serving this port? Its local URL, or None."""
     import urllib.request
@@ -56,22 +85,86 @@ def existing_tastebuds(port):
     return None
 
 
+def selftest():
+    """Health check of a build — the release workflow runs it on every
+    download it makes: server, page, icons, API, NumPy, and the recommender,
+    all in-process, no window. Exit code 0 = healthy; a report is printed and,
+    if TASTEBUDS_SELFTEST_REPORT names a file, written there too."""
+    import json
+    import urllib.request
+    server, url = tastebuds.create_server(lan=False)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def page():
+        with urllib.request.urlopen(url, timeout=10) as r:
+            assert b"Tastebuds" in r.read(), "page has no title"
+
+    def icon():
+        with urllib.request.urlopen(url + "icon-192.png", timeout=10) as r:
+            assert r.read(8) == b"\x89PNG\r\n\x1a\n", "icon is not a PNG"
+
+    def api():
+        req = urllib.request.Request(url + "api/state", headers={"X-Token": tastebuds.TOKEN})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            assert "needs_onboarding" in json.loads(r.read().decode("utf-8"))
+
+    def numpy_ok():
+        import numpy
+        assert float(numpy.ones(3).sum()) == 3.0
+
+    def recommender():
+        ok, data = tastebuds.run_recommender(["--offline", "--train-only"])
+        assert ok, data
+
+    def window_lib():
+        if getattr(sys, "frozen", False):   # the built app must carry pywebview
+            import webview  # noqa: F401
+
+    lines, failed = ["Tastebuds %s selftest · python %s · %s" % (
+        tastebuds.VERSION, sys.version.split()[0], sys.platform)], 0
+    for name, fn in (("page", page), ("icon", icon), ("api", api), ("numpy", numpy_ok),
+                     ("recommender", recommender), ("window", window_lib)):
+        try:
+            fn()
+            lines.append("  ok    " + name)
+        except Exception as e:
+            failed += 1
+            lines.append("  FAIL  %s: %r" % (name, e))
+    server.shutdown()
+    report = "\n".join(lines + ["%d check(s) failed" % failed if failed else "all checks passed"])
+    print(report)
+    out = os.environ.get("TASTEBUDS_SELFTEST_REPORT")
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(report + "\n")
+    return 1 if failed else 0
+
+
 def main():
+    if SELFTEST:
+        sys.exit(selftest())
     try:
         open(LOG_PATH, "w").close()   # fresh log per launch
     except Exception:
         pass
-    log("launcher start · python %s" % sys.version.split()[0])
+    log("launcher start · tastebuds %s · python %s · %s" % (
+        tastebuds.VERSION, sys.version.split()[0], sys.platform))
 
-    lan = os.environ.get("TASTEBUDS_LAN", "1") == "1"
+    # One window per computer: if Tastebuds is already running, show that one.
+    # (Checked before binding — on Windows a second bind can quietly succeed.)
+    port = tastebuds.LAN_PORT_DEFAULT
+    running = existing_tastebuds(port) if port_in_use(port) else None
+    if running:
+        log("already running at %s — opening it and exiting" % running)
+        webbrowser.open(running)
+        return
+    # The window always lives on 127.0.0.1:8765 (a stable address keeps the
+    # page's saved preferences). Pairing adds a LAN listener only when asked.
+    lan = os.environ.get("TASTEBUDS_LAN", "0") == "1"
     try:
-        server, url = tastebuds.create_server(lan=lan)
+        server, url = tastebuds.create_server(lan=lan, port=port)
     except OSError:
-        running = existing_tastebuds(tastebuds.LAN_PORT_DEFAULT)
-        if running:                    # another Tastebuds is live — just show it
-            log("already running at %s — opening it and exiting" % running)
-            webbrowser.open(running)
-            return
+        log("port %d busy (not Tastebuds) — using a free port" % port)
         server, url = tastebuds.create_server(lan=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log("server up at %s · lan=%s" % (url, tastebuds.LAN_MODE))

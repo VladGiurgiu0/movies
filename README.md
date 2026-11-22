@@ -22,7 +22,21 @@ dependency (NumPy).
 
 ## Get started
 
-**On a Mac — two double-clicks, no terminal.**
+**The easy way — download and open, no Python, no terminal.**
+
+Go to [Releases](https://github.com/VladGiurgiu0/movies/releases/latest) and
+download:
+
+- **Mac (Apple Silicon, M1 or newer):** `Tastebuds-…-mac-AppleSilicon.dmg` —
+  open it and drag Tastebuds into Applications.
+- **Windows 10/11:** `TastebudsSetup-….exe` — run it; it installs for your
+  user only, no administrator rights needed.
+
+The downloads aren't signed yet, so the very first launch shows a one-time
+security warning. [INSTALL.md](INSTALL.md) shows exactly what to click, on
+both systems.
+
+**From the code, on a Mac — two double-clicks.**
 
 1. Get the code: **Code → Download ZIP** on GitHub (unzip it anywhere you like),
    or `git clone https://github.com/VladGiurgiu0/movies.git`.
@@ -43,9 +57,10 @@ cd movies
 python3 tastebuds.py
 ```
 
-**First run:** a short in-app setup asks for a free TMDb key (guided, about two
-minutes — see [Get your own TMDb API key](#get-your-own-tmdb-api-key)) and helps
-you build your first channel from a film you love. There is nothing to configure
+**First run:** a short in-app setup asks for a TMDb key — paste one a friend
+shared with you, or get your own free one (guided, about two minutes — see
+[Get your own TMDb API key](#get-your-own-tmdb-api-key)) — and helps you build
+your first channel from a film you love. There is nothing to configure
 up front, and everything the app writes stays in plain files you own.
 
 **On your phone or tablet:** one QR scan — see
@@ -136,8 +151,9 @@ up front, and everything the app writes stays in plain files you own.
 
 ## Get your own TMDb API key
 
-The app needs a TMDb API key to fetch movies, posters, and metadata. It's free
-and takes about two minutes.
+The app needs a TMDb API key to fetch movies, posters, and metadata. If a
+friend shared their key with you, just paste it in the first-run setup and skip
+this section. Otherwise, getting your own is free and takes about two minutes.
 
 1. **Create an account** at <https://www.themoviedb.org/signup> and verify your
    email.
@@ -181,14 +197,15 @@ or move (move the folder + set `TASTEBUDS_HOME`, and everything follows).
 
 ## On your phone or tablet (home Wi-Fi)
 
-Start Tastebuds in LAN mode and pair any phone or tablet in the house:
+Pairing is **off until you switch it on**. Click **Pair a phone** (top right,
+next to the Movie night switch) and then **Turn on pairing**: from then until
+you quit (or click **Turn off pairing**), phones and tablets on the same Wi-Fi
+can reach Tastebuds — but only those that scan the code. Your computer may ask
+once whether Tastebuds can accept incoming connections; choose **Allow**. (To
+keep pairing on from the start instead, run `python3 tastebuds.py --lan`, or
+set `TASTEBUDS_LAN=1` for the app.)
 
-```bash
-python3 tastebuds.py --lan
-```
-
-Then click **Pair a phone** (top right, next to the Movie night switch), scan
-the QR code with the phone's camera, and in Safari choose **Share → Add to Home
+Scan the QR code with the phone's camera, and in Safari choose **Share → Add to Home
 Screen**. Tastebuds now opens from the phone like an app — same data, same
 model, served by your computer. The pairing link uses your computer's Bonjour
 name (`your-mac.local`) plus a private token that stays stable across
@@ -209,22 +226,36 @@ creates your data folder at `~/Tastebuds`, and assembles the app in
 
 The app behaves like a proper Mac citizen: the window's **close button hides
 it into the Dock** while the server keeps running — so a paired phone or
-tablet stays connected. Click the Dock icon to bring the window back; quit
+tablet stays connected while pairing is on. Click the Dock icon to bring the window back; quit
 for real with **Cmd+Q** (or right-click the Dock icon → Quit). Launching the
 app while it's already running simply opens the running one.
 Your data is never touched by installing or updating: it lives in plain files
 in `~/Tastebuds` (or next to the code, if you started that way).
 
-For a fully self-contained `Tastebuds.app` you can hand to someone *without*
-the repo, there's also a PyInstaller build:
+The self-contained `Tastebuds.app` in the [Releases](https://github.com/VladGiurgiu0/movies/releases)
+is built by GitHub (see [Making a release](#making-a-release)). To build one
+locally instead:
 
 ```bash
 pip install pyinstaller pywebview numpy
 make app          # builds dist/Tastebuds.app
+make selftest     # headless health check of the build
 ```
 
-Unsigned builds need one right-click → Open on first launch (Gatekeeper). See
-the `Makefile` for .dmg packaging and notarization notes.
+Unsigned builds show a one-time Gatekeeper warning on first launch
+([INSTALL.md](INSTALL.md) has the clicks). See the `Makefile` for .dmg
+packaging and notarization notes.
+
+## Windows — details
+
+`TastebudsSetup-….exe` installs Tastebuds for your user only (into
+`%LOCALAPPDATA%\Programs\Tastebuds`, no administrator rights), with a
+Start-menu entry, an optional desktop icon, and an uninstaller in
+**Settings → Apps**. Python and NumPy are bundled; the window uses the Edge
+engine built into Windows. Closing the window quits, as Windows apps do.
+Your data lives in plain files in `%USERPROFILE%\Tastebuds`, and installing,
+updating, or uninstalling never touches it. **About → Open data folder** shows it
+in Explorer (the same button opens Finder on a Mac).
 
 ## Channels
 
@@ -263,6 +294,7 @@ pools just need to point in roughly the right direction. Channels live in
 | `poster_cache.json` | **no** (git-ignored) | cached poster paths for the watchlist view — auto-created |
 | `model_weights.json` | **no** (git-ignored) | how strongly each reaction trains your model — set in the Model panel |
 | `tmdb_key.txt` | **no** (git-ignored) | your private API key |
+| `lan_token.txt` | **no** (git-ignored) | the private pairing token for your phones — created the first time you turn on pairing |
 
 The data files are git-ignored so a public repo never leaks your taste log or
 key. The script recreates empty `movies.md` / `watchlist.md` from built-in
@@ -335,6 +367,24 @@ automatically if it isn't installed. From the repo root:
 python3 -m unittest discover -s tests -v
 ```
 
+The same suite runs automatically on macOS, Windows, and Linux for every push
+(`.github/workflows/tests.yml`).
+
+## Making a release
+
+The downloads for friends are built by GitHub Actions
+(`.github/workflows/release.yml`) — no Mac or Windows build machine needed.
+
+1. Bump `VERSION` near the top of `tastebuds.py` (e.g. `"1.0.1"`), commit, push.
+2. Tag it with the same number and push the tag:
+   `git tag v1.0.1 && git push origin v1.0.1`
+3. The workflow runs the tests, builds the Mac `.dmg` and the Windows installer,
+   runs `--selftest` on each built app, and attaches both to a **draft** release.
+   Check it under **Releases**, then press **Publish**.
+
+For a dry run without a release, use **Actions → release → Run workflow**; the
+builds are attached to the run as downloadable artifacts.
+
 ## References
 
 1. Barile, F., Draws, T., Inel, O., et al. (2023). Evaluating explainable social
@@ -376,6 +426,11 @@ python3 -m unittest discover -s tests -v
     recommendation algorithms: A quest for the state-of-the-art. *Proceedings
     of the 30th ACM Conference on User Modeling, Adaptation and Personalization
     (UMAP)*.
+
+## Credits
+
+Movie data and images come from [The Movie Database (TMDB)](https://www.themoviedb.org).
+This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 ## License
 

@@ -775,5 +775,163 @@ class TestMovieNight(unittest.TestCase):
         self.assertEqual(self._night("nonsense")["combine"], "least_misery")
 
 
+# --------------------------------------------------------------------------
+# Cross-platform release work: pairing on demand, About, Windows-safe writes
+# --------------------------------------------------------------------------
+class TestReplaceRetry(unittest.TestCase):
+    """Windows can lock a file for a moment (editor, sync client, antivirus)."""
+
+    def test_retries_then_succeeds(self):
+        calls = {"n": 0}
+        real = os.replace
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError("locked")
+            return real(src, dst)
+
+        tmp = tempfile.mkdtemp()
+        target = os.path.join(tmp, "x.md")
+        tb.os.replace = flaky
+        try:
+            tb._atomic_write(target, "ok")
+        finally:
+            tb.os.replace = real
+        self.assertEqual(calls["n"], 3)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ok")
+
+    def test_gives_up_and_cleans_temp(self):
+        real = os.replace
+
+        def locked(src, dst):
+            raise PermissionError("locked")
+
+        tmp = tempfile.mkdtemp()
+        tb.os.replace = locked
+        try:
+            with self.assertRaises(PermissionError):
+                tb._atomic_write(os.path.join(tmp, "x.md"), "nope")
+        finally:
+            tb.os.replace = real
+        self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".tmp_")], [])
+
+
+class TestPairingOnDemand(unittest.TestCase):
+    """'Pair a phone' starts a LAN listener only when switched on. Simulated on
+    loopback: the 'LAN address' is 127.0.0.2 and the 'phone' connects from
+    127.0.0.3 (skipped where those aren't bindable, e.g. stock macOS)."""
+
+    def setUp(self):
+        import socket
+        import threading
+        from http.server import ThreadingHTTPServer
+        for ip in ("127.0.0.2", "127.0.0.3"):
+            s = socket.socket()
+            try:
+                s.bind((ip, 0))
+            except OSError:
+                self.skipTest("extra loopback addresses not available here")
+            finally:
+                s.close()
+        s = socket.socket()
+        s.bind(("127.0.0.2", 0))
+        self.lan_port = s.getsockname()[1]
+        s.close()
+        self.saved = {k: getattr(tb, k) for k in
+                      ("lan_ip", "_usable_lan_ip", "lan_hostname", "LAN_TOKEN_PATH")}
+        tb.lan_ip = lambda: "127.0.0.2"
+        tb._usable_lan_ip = lambda ip: True
+        tb.lan_hostname = lambda: None
+        tb.LAN_TOKEN_PATH = os.path.join(tempfile.mkdtemp(), "lan_token.txt")
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), tb.Handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        tb.disable_lan()
+        self.srv.shutdown()
+        self.srv.server_close()
+        for k, v in self.saved.items():
+            setattr(tb, k, v)
+
+    def _req(self, host, port, path, token=None, method="GET", src=None):
+        import http.client
+        c = http.client.HTTPConnection(host, port, timeout=5,
+                                       source_address=(src, 0) if src else None)
+        c.request(method, path, body=b"{}" if method == "POST" else None,
+                  headers={"X-Token": token} if token else {})
+        r = c.getresponse()
+        return r.status, r.read().decode("utf-8")
+
+    def _local(self, path, method="GET"):
+        return self._req("127.0.0.1", self.port, path, tb.TOKEN, method)
+
+    def _phone(self, path, token=None, method="GET"):
+        return self._req("127.0.0.2", self.lan_port, path, token, method, src="127.0.0.3")
+
+    def test_off_until_switched_on(self):
+        st, body = self._local("/api/pair")
+        self.assertEqual(st, 200)
+        self.assertIsNone(json.loads(body)["url"])
+        self.assertFalse(tb.LAN_MODE)
+
+    def test_switch_on_pair_and_switch_off(self):
+        ok, _ = tb.enable_lan(port=self.lan_port)
+        self.assertTrue(ok)
+        pt = tb.PAIR_TOKEN
+        self.assertNotEqual(pt, tb.TOKEN)                 # the window's token never leaves it
+        self.assertEqual(self._phone("/")[0], 403)        # unpaired device
+        st, page = self._phone("/?t=" + pt)
+        self.assertEqual(st, 200)
+        self.assertIn("'%s'" % pt, page)
+        self.assertNotIn("'%s'" % tb.TOKEN, page)
+        self.assertEqual(self._phone("/api/state", pt)[0], 200)
+        self.assertEqual(self._phone("/api/state", "0" * 32)[0], 403)
+        # only the computer itself may flip pairing or open its folders
+        self.assertEqual(self._phone("/api/pair/disable", pt, "POST")[0], 403)
+        self.assertEqual(self._phone("/api/open-data-folder", pt, "POST")[0], 403)
+        self.assertIsNone(json.loads(self._phone("/api/about", pt)[1])["data_dir"])
+        st, body = self._local("/api/pair/disable", "POST")
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertFalse(tb.LAN_MODE)
+        self.assertEqual(self._local("/api/state")[0], 200)   # window unaffected
+        with self.assertRaises(OSError):
+            self._phone("/?t=" + pt)                          # listener is gone
+        # the pairing token persists, so home-screen icons work again next time
+        tb.enable_lan(port=self.lan_port)
+        self.assertEqual(tb.PAIR_TOKEN, pt)
+        self.assertEqual(self._phone("/?t=" + pt)[0], 200)
+
+    def test_startup_lan_cannot_be_switched_off(self):
+        tb.LAN_MODE, tb._LAN_SERVER = True, None              # as after --lan
+        try:
+            ok, _ = tb.disable_lan()
+            self.assertFalse(ok)
+        finally:
+            tb.LAN_MODE = False
+
+
+class TestAboutAndVersion(unittest.TestCase):
+    def test_version_is_semver(self):
+        import re
+        self.assertRegex(tb.VERSION, r"^\d+\.\d+\.\d+$")
+
+    def test_no_network_means_no_pairing(self):
+        saved = tb.lan_ip
+        tb.lan_ip = lambda: "127.0.0.1"                       # what lan_ip() returns offline
+        try:
+            ok, msg = tb.enable_lan()
+        finally:
+            tb.lan_ip = saved
+        self.assertFalse(ok)
+        self.assertFalse(tb.LAN_MODE)
+
+    def test_page_carries_tmdb_attribution(self):
+        self.assertIn("This product uses the TMDB API but is not endorsed or certified by TMDB.",
+                      " ".join(tb.PAGE.split()))
+
+
 if __name__ == "__main__":
     unittest.main()

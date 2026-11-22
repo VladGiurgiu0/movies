@@ -58,6 +58,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # --------------------------------------------------------------------------
 # Config / paths
 # --------------------------------------------------------------------------
+VERSION = "1.0.0"   # bump together with the release tag (v1.0.0 -> builds the downloads)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # where the CODE lives
 # Where the DATA lives — one rule everywhere (terminal, app, recommender):
 #   1. an explicit TASTEBUDS_HOME always wins;
@@ -426,6 +427,20 @@ def _fetch_movie_seed(channel):
 # --------------------------------------------------------------------------
 # Markdown table read / write
 # --------------------------------------------------------------------------
+def _replace_retry(src, dst, attempts=8):
+    """os.replace() with a short retry: on Windows the target can be locked for
+    a moment by another program (an editor, a sync client, antivirus)."""
+    import time as _time
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            _time.sleep(0.05 * (i + 1))
+
+
 def _atomic_write(path, text):
     """Write atomically: temp file in the same dir, then os.replace()."""
     d = os.path.dirname(path) or "."
@@ -433,7 +448,7 @@ def _atomic_write(path, text):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, path)
+        _replace_retry(tmp, path)
     except Exception:
         try:
             os.remove(tmp)
@@ -1193,9 +1208,12 @@ def run_recommender(extra_args, timeout=600):
 # LAN mode + QR pairing (all stdlib, like the rest of the rater)
 #
 # Off by default: the server binds 127.0.0.1 with a fresh token per run, as
-# always. With --lan (or TASTEBUDS_LAN=1) it binds the local network on a
-# stable port with a PERSISTENT pairing token, so a phone's home-screen icon
-# keeps working across restarts. Non-local visitors must present the token
+# always. Pairing switches on only when asked for — "Pair a phone" -> "Turn on
+# pairing" starts a second listener on this machine's LAN address (enable_lan),
+# for this session only. With --lan (or TASTEBUDS_LAN=1) the whole server binds
+# the local network from the start instead. Either way the port is stable and
+# the pairing token PERSISTENT, so a phone's home-screen icon keeps working
+# across restarts. Non-local visitors must present the token
 # (?t=...) to get the page — delivered by scanning the QR in "Pair a phone".
 # The Host-header check still pins requests to loopback or our advertised LAN
 # IP, so DNS-rebinding stays closed.
@@ -1206,6 +1224,8 @@ LAN_HOST = None      # Bonjour .local name — the stable way to reach this mach
 LAN_PORT = None
 LAN_PORT_DEFAULT = 8765
 LAN_TOKEN_PATH = os.path.join(DATA_DIR, "lan_token.txt")
+PAIR_TOKEN = None    # what paired devices present (persistent); the local window keeps TOKEN
+_LAN_SERVER = None   # the on-demand pairing listener; None when off or fixed by --lan
 
 
 def lan_ip():
@@ -1272,12 +1292,73 @@ def pair_url():
     if not LAN_MODE:
         return None
     host = LAN_HOST or LAN_IP
-    return f"http://{host}:{LAN_PORT}/?t={TOKEN}"
+    return f"http://{host}:{LAN_PORT}/?t={PAIR_TOKEN}"
 
 
 def pair_url_ip():
     """Numeric-address fallback (some non-Apple devices don't resolve .local)."""
-    return f"http://{LAN_IP}:{LAN_PORT}/?t={TOKEN}" if LAN_MODE else None
+    return f"http://{LAN_IP}:{LAN_PORT}/?t={PAIR_TOKEN}" if LAN_MODE else None
+
+
+def _usable_lan_ip(ip):
+    return bool(ip) and not ip.startswith("127.")   # lan_ip() falls back to loopback offline
+
+
+def enable_lan(port=None):
+    """Turn pairing on for this session: a second listener on this machine's
+    LAN address, sharing the same handler; the local window keeps its own
+    loopback server and token. Returns (ok, message)."""
+    global LAN_MODE, LAN_IP, LAN_HOST, LAN_PORT, PAIR_TOKEN, _LAN_SERVER
+    if LAN_MODE:
+        return True, "on"
+    ip = lan_ip()
+    if not _usable_lan_ip(ip):
+        return False, "No network found. Connect this computer to Wi-Fi and try again."
+    p = int(port or LAN_PORT_DEFAULT)
+    try:
+        srv = ThreadingHTTPServer((ip, p), Handler)
+    except OSError:
+        return False, "Port %d is busy on this computer, so pairing can't start." % p
+    LAN_IP, LAN_PORT = ip, p
+    LAN_HOST = lan_hostname()
+    PAIR_TOKEN = persistent_token()
+    _LAN_SERVER = srv
+    LAN_MODE = True          # last: the Host check only admits LAN names from here on
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return True, "on"
+
+
+def disable_lan():
+    """Turn on-demand pairing off again (paired icons work again next time)."""
+    global LAN_MODE, LAN_IP, LAN_HOST, LAN_PORT, _LAN_SERVER
+    if not LAN_MODE:
+        return True, "off"
+    srv = _LAN_SERVER
+    if srv is None:
+        return False, "Pairing was switched on at startup (--lan) and stays on until you quit."
+    LAN_MODE = False         # first: stop admitting LAN requests
+    _LAN_SERVER = None
+    LAN_IP = LAN_HOST = LAN_PORT = None
+    try:
+        srv.shutdown()
+        srv.server_close()
+    except Exception:
+        pass
+    return True, "off"
+
+
+def open_data_folder():
+    """Show the data folder in Finder / Explorer / the desktop's file manager."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", DATA_DIR])
+        elif os.name == "nt":
+            os.startfile(DATA_DIR)   # noqa: only exists on Windows
+        else:
+            subprocess.Popen(["xdg-open", DATA_DIR])
+        return True
+    except Exception:
+        return False
 
 
 # ---- QR encoder (byte mode, ECC level M, versions 1-10) --------------------
@@ -1934,7 +2015,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="page">
     <div class="topline">
       <div class="tally" id="tally" style="text-align:left"></div>
-      <div class="nightctl"><button class="ghost" id="pair-btn" hidden>Pair a phone</button><span class="nlabel">Movie night</span><button class="lswitch" id="night-switch" aria-label="Toggle movie night" title="Movie night: one film for you and your buddies"><span class="knob"></span></button></div>
+      <div class="nightctl"><button class="ghost" id="about-btn">About</button><button class="ghost" id="pair-btn" hidden>Pair a phone</button><span class="nlabel">Movie night</span><button class="lswitch" id="night-switch" aria-label="Toggle movie night" title="Movie night: one film for you and your buddies"><span class="knob"></span></button></div>
     </div>
     <div class="flip-wrap" id="flipwrap">
      <div class="flip" id="flip">
@@ -2183,10 +2264,10 @@ PAGE = r"""<!DOCTYPE html>
       <div class="onb-step" id="onb-key">
         <span class="onb-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 20 3M16 7l3 3M14.5 8.5l2.5 2.5"/></svg></span>
         <div class="onb-h">Connect The Movie Database</div>
-        <p class="onb-p">Tastebuds uses TMDb for posters, cast, and details. Paste your free API key to begin.</p>
+        <p class="onb-p">Tastebuds uses TMDb for posters, cast, and details. Paste your free API key to begin &mdash; or the key a friend shared with you.</p>
         <input class="onb-field" id="onb-key-input" placeholder="TMDb API key (v3 auth)" autocomplete="off">
         <div class="onb-err" id="onb-key-err"></div>
-        <p class="onb-note"><a class="link" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">How to get one — about 2 minutes</a> · saved only on your machine, in tmdb_key.txt</p>
+        <p class="onb-note"><a class="link" href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">No key yet? Get your own — about 2 minutes</a> · saved only on your machine, in tmdb_key.txt</p>
         <div class="onb-row"><button class="pbtn cancel" id="onb-key-back">Back</button><button class="pbtn primary" id="onb-key-continue">Continue</button></div>
       </div>
 
@@ -2221,13 +2302,41 @@ PAGE = r"""<!DOCTYPE html>
       <div class="phead"><h2>Tastebuds on your phone</h2><button class="x" id="close-pair">&times;</button></div>
       <p class="desc">Same Wi-Fi, one scan. Your data stays on this computer — the phone is just
         another window onto it.</p>
+      <div id="pair-off" hidden>
+        <p class="desc">Pairing is off. Turning it on lets phones and tablets on this Wi-Fi open
+          Tastebuds &mdash; only those that scan the code &mdash; until you quit or turn it off.
+          Your computer may ask whether Tastebuds can accept incoming connections: choose
+          <b>Allow</b>.</p>
+        <div class="onb-row" style="justify-content:center;margin-top:6px"><button class="pbtn primary" id="pair-on">Turn on pairing</button></div>
+      </div>
+      <div class="onb-err" id="pair-err" style="text-align:center"></div>
       <div id="pair-qr" style="display:flex;justify-content:center;margin:14px 0"></div>
       <div class="note" id="pair-url" style="text-align:center;word-break:break-all"></div>
+      <div style="text-align:center;margin-top:8px"><button class="ghost" id="pair-stop" hidden>Turn off pairing</button></div>
       <ol class="desc" style="margin-top:14px;padding-left:20px;line-height:1.8">
         <li>Scan the code with the phone's camera and open the link.</li>
         <li>In Safari: <b>Share</b> &rarr; <b>Add to Home Screen</b>.</li>
         <li>Tastebuds now opens from the phone like any app — as long as this computer is on.</li>
       </ol>
+    </div>
+  </div>
+
+  <div class="overlay" id="about-overlay">
+    <div class="panel" style="max-width:430px">
+      <div class="phead"><h2>About Tastebuds</h2><button class="x" id="close-about">&times;</button></div>
+      <p class="desc">Version <span id="about-ver"></span>. A movie rater and recommender that keeps
+        everything on your own computer.</p>
+      <div id="about-data" hidden>
+        <p class="desc">Your ratings, watchlist, and settings are plain files in<br>
+          <span id="about-dir" style="word-break:break-all;color:var(--txt)"></span></p>
+        <button class="pbtn cancel" id="about-open">Open data folder</button>
+      </div>
+      <div style="margin-top:22px;border-top:1px solid var(--line);padding-top:14px">
+        <img id="about-tmdb-logo" src="" alt="TMDB" style="height:14px;display:block;margin-bottom:8px" hidden>
+        <p class="note" style="margin-top:0">Movie data and images come from
+          <a class="link" style="font-size:inherit" href="https://www.themoviedb.org" target="_blank" rel="noopener">The Movie Database (TMDB)</a>.
+          This product uses the TMDB API but is not endorsed or certified by TMDB.</p>
+      </div>
     </div>
   </div>
 
@@ -3198,21 +3307,56 @@ async function nightPick(){
   btn.textContent='Next pick';
   nightIdx=0; project(nightPicks[0]);
 }
-/* ---- Pair a phone (LAN mode) ---- */
+/* ---- Pair a phone (off until switched on here) ---- */
+function renderPair(d){
+  const qr=document.getElementById('pair-qr'), u=document.getElementById('pair-url');
+  const on=!!(d && d.url);
+  document.getElementById('pair-off').hidden = on;
+  document.getElementById('pair-stop').hidden = !(on && d.can_toggle);
+  if(on){
+    qr.innerHTML=d.svg;
+    u.innerHTML=esc(d.url)+(d.alt?('<br><span style="opacity:.65">not opening? try '+esc(d.alt)+'</span>'):'');
+  } else { qr.innerHTML=''; u.textContent=''; }
+}
 async function openPair(){
   document.getElementById('pair-overlay').classList.add('open');
+  document.getElementById('pair-err').textContent='';
+  document.getElementById('pair-off').hidden=true;
+  document.getElementById('pair-stop').hidden=true;
   const qr=document.getElementById('pair-qr'), u=document.getElementById('pair-url');
-  qr.innerHTML='<div class="note">…</div>';
+  qr.innerHTML='<div class="note">…</div>'; u.textContent='';
+  try{ renderPair(await (await fetch('/api/pair')).json()); }
+  catch(e){ qr.innerHTML=''; u.textContent='Could not load the pairing code.'; }
+}
+async function pairSwitch(on){
+  const err=document.getElementById('pair-err'), b=document.getElementById(on?'pair-on':'pair-stop');
+  err.textContent=''; b.disabled=true;
   try{
-    const d=await (await fetch('/api/pair')).json();
-    if(d.url){
-      qr.innerHTML=d.svg;
-      u.innerHTML=esc(d.url)+(d.alt?('<br><span style="opacity:.65">not opening? try '+esc(d.alt)+'</span>'):'');
-    }
-    else { qr.innerHTML=''; u.textContent='LAN mode is off — start Tastebuds with --lan to pair phones.'; }
-  }catch(e){ u.textContent='Could not load the pairing code.'; }
+    const d=await (await fetch(on?'/api/pair/enable':'/api/pair/disable',{method:'POST'})).json();
+    if(!d.ok) err.textContent=d.message||'Something went wrong.';
+    renderPair(d);
+  }catch(e){ err.textContent='Could not reach Tastebuds.'; }
+  b.disabled=false;
 }
 document.getElementById('pair-btn').onclick = openPair;
+document.getElementById('pair-on').onclick = ()=>pairSwitch(true);
+document.getElementById('pair-stop').onclick = ()=>pairSwitch(false);
+/* ---- About ---- */
+async function openAbout(){
+  document.getElementById('about-overlay').classList.add('open');
+  try{
+    const d=await (await fetch('/api/about')).json();
+    document.getElementById('about-ver').textContent=d.version||'';
+    document.getElementById('about-data').hidden=!d.can_open;
+    document.getElementById('about-dir').textContent=d.data_dir||'';
+    const logo=document.getElementById('about-tmdb-logo');
+    if(d.tmdb_logo){ logo.src='/tmdb-logo.svg'; logo.hidden=false; }
+  }catch(e){}
+}
+document.getElementById('about-btn').onclick = openAbout;
+document.getElementById('about-open').onclick = ()=>fetch('/api/open-data-folder',{method:'POST'});
+document.getElementById('close-about').onclick = ()=>document.getElementById('about-overlay').classList.remove('open');
+document.getElementById('about-overlay').onclick = e=>{ if(e.target.id==='about-overlay') document.getElementById('about-overlay').classList.remove('open'); };
 document.getElementById('close-pair').onclick = ()=>document.getElementById('pair-overlay').classList.remove('open');
 document.getElementById('pair-overlay').onclick = e=>{ if(e.target.id==='pair-overlay') document.getElementById('pair-overlay').classList.remove('open'); };
 
@@ -3307,7 +3451,7 @@ document.getElementById('onb-overlay').onclick = e=>{ if(e.target.id==='onb-over
 
 (async function boot(){
   let st={}; try{ st=await (await fetch('/api/state')).json(); }catch(e){}
-  document.getElementById('pair-btn').hidden = !st.lan;
+  document.getElementById('pair-btn').hidden = !st.local;   // the computer itself pairs; phones don't
   onboardingActive = !!st.needs_onboarding;   // only on a genuinely fresh install
   if(onboardingActive){ onbOpen(!st.has_key); } else { loadNext(); }
   try { recProfile = localStorage.getItem('recProfile') || 'you'; } catch(e){}
@@ -3348,6 +3492,14 @@ class Handler(BaseHTTPRequestHandler):
     def _is_local_peer(self):
         return self.client_address[0] in ("127.0.0.1", "::1")
 
+    def _token_ok(self):
+        # The local window carries TOKEN; paired devices carry PAIR_TOKEN
+        # (identical when the server was started with --lan).
+        t = self.headers.get("X-Token") or ""
+        if t == TOKEN:
+            return True
+        return bool(LAN_MODE and PAIR_TOKEN and t == PAIR_TOKEN)
+
     def do_GET(self):
         if not self._host_ok():
             self._send(403, json.dumps({"error": "forbidden"}))
@@ -3356,20 +3508,21 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path)
         if p.path in ("/", "/index", "/index.html"):
             if not self._is_local_peer():   # LAN visitors must present the pairing token
-                if parse_qs(p.query).get("t", [""])[0] != TOKEN:
+                if not (LAN_MODE and PAIR_TOKEN and parse_qs(p.query).get("t", [""])[0] == PAIR_TOKEN):
                     self._send(403, "<html><body style='font-family:sans-serif;padding:40px'>"
                                     "<h3>Tastebuds</h3><p>This device isn't paired. On the computer "
                                     "running Tastebuds, open <b>Pair a phone</b> and scan the QR code."
                                     "</p></body></html>", "text/html; charset=utf-8")
                     return
-            page = PAGE.replace("__CW_TOKEN__", TOKEN)
-            if not self._is_local_peer():   # phone's manifest link must carry the token
-                page = page.replace('href="/manifest.json"', 'href="/manifest.json?t=%s"' % TOKEN)
+            local = self._is_local_peer()
+            page = PAGE.replace("__CW_TOKEN__", TOKEN if local else PAIR_TOKEN)
+            if not local:                   # phone's manifest link must carry the token
+                page = page.replace('href="/manifest.json"', 'href="/manifest.json?t=%s"' % PAIR_TOKEN)
             self._send(200, page, "text/html; charset=utf-8")
             return
         if p.path == "/manifest.json":
-            start = "/?t=" + TOKEN if (LAN_MODE and not self._is_local_peer()
-                                       and parse_qs(p.query).get("t", [""])[0] == TOKEN) else "/"
+            start = "/?t=" + PAIR_TOKEN if (LAN_MODE and PAIR_TOKEN and not self._is_local_peer()
+                                            and parse_qs(p.query).get("t", [""])[0] == PAIR_TOKEN) else "/"
             self._send(200, json.dumps({
                 "name": "Tastebuds", "short_name": "Tastebuds", "start_url": start,
                 "scope": "/", "display": "standalone",
@@ -3388,14 +3541,31 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, json.dumps({"error": "no icon"}))
             return
-        if self.headers.get("X-Token") != TOKEN:
+        if p.path == "/tmdb-logo.svg":
+            fp = os.path.join(SCRIPT_DIR, "assets", "tmdb-logo.svg")
+            if os.path.exists(fp):
+                with open(fp, "rb") as f:
+                    self._send(200, f.read(), "image/svg+xml")
+            else:
+                self._send(404, json.dumps({"error": "no logo"}))
+            return
+        if not self._token_ok():
             self._send(403, json.dumps({"error": "forbidden"}))
             return
         if p.path == "/api/pair":
             u, ui = pair_url(), pair_url_ip()
             self._send(200, json.dumps({"lan": LAN_MODE, "url": u,
                                         "alt": ui if (u and ui != u) else None,
-                                        "svg": qr_svg(u) if u else None}))
+                                        "svg": qr_svg(u) if u else None,
+                                        "can_toggle": self._is_local_peer() and _LAN_SERVER is not None}))
+            return
+        if p.path == "/api/about":
+            local = self._is_local_peer()
+            self._send(200, json.dumps({
+                "version": VERSION,
+                "data_dir": DATA_DIR if local else None,
+                "can_open": local,
+                "tmdb_logo": os.path.exists(os.path.join(SCRIPT_DIR, "assets", "tmdb-logo.svg"))}))
             return
         if self.path.startswith("/api/next"):
             from urllib.parse import urlparse, parse_qs
@@ -3430,7 +3600,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"results": search_keywords(q)}))
         elif self.path.startswith("/api/state"):
             self._send(200, json.dumps({"needs_onboarding": needs_onboarding(), "has_key": bool(API_KEY),
-                                        "lan": LAN_MODE}))
+                                        "lan": LAN_MODE, "local": self._is_local_peer()}))
         elif self.path.startswith("/api/weights"):
             self._send(200, json.dumps({"weights": load_weights()}))
         elif self.path.startswith("/api/watchlist"):
@@ -3471,8 +3641,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", 0) or 0)
         raw = self.rfile.read(length) if length else b""
-        if self.headers.get("X-Token") != TOKEN:
+        if not self._token_ok():
             self._send(403, json.dumps({"error": "forbidden"}))
+            return
+
+        if self.path in ("/api/pair/enable", "/api/pair/disable", "/api/open-data-folder"):
+            if not self._is_local_peer():   # only the computer itself may flip these
+                self._send(403, json.dumps({"error": "forbidden"}))
+                return
+            if self.path == "/api/open-data-folder":
+                self._send(200, json.dumps({"ok": open_data_folder()}))
+                return
+            ok, msg = enable_lan() if self.path.endswith("/enable") else disable_lan()
+            u, ui = pair_url(), pair_url_ip()
+            self._send(200, json.dumps({"ok": ok, "message": msg, "lan": LAN_MODE, "url": u,
+                                        "alt": ui if (u and ui != u) else None,
+                                        "svg": qr_svg(u) if u else None,
+                                        "can_toggle": _LAN_SERVER is not None}))
             return
 
         if self.path.startswith("/api/rate"):
@@ -3700,7 +3885,7 @@ def create_server(lan=False, port=None):
     """Prepare data files and return (server, local_url). With lan=True the
     server binds the whole LAN on a stable port with a persistent pairing
     token, so phones' home-screen icons keep working across restarts."""
-    global TOKEN, LAN_MODE, LAN_IP, LAN_HOST, LAN_PORT
+    global TOKEN, PAIR_TOKEN, LAN_MODE, LAN_IP, LAN_HOST, LAN_PORT
     os.makedirs(DATA_DIR, exist_ok=True)
     load_channels()  # (fresh installs have none yet; onboarding/UI creates the first)
     # one-time migration: dismissed.md -> not-interested.md (keeps your existing data)
@@ -3717,7 +3902,7 @@ def create_server(lan=False, port=None):
         LAN_IP = lan_ip()
         LAN_HOST = lan_hostname()
         LAN_PORT = int(port or LAN_PORT_DEFAULT)
-        TOKEN = persistent_token()
+        TOKEN = PAIR_TOKEN = persistent_token()
         server = ThreadingHTTPServer(("0.0.0.0", LAN_PORT), Handler)
     else:
         server = ThreadingHTTPServer(("127.0.0.1", int(port or 0)), Handler)
@@ -3726,6 +3911,9 @@ def create_server(lan=False, port=None):
 
 
 def main():
+    if "--version" in sys.argv:
+        print("Tastebuds " + VERSION)
+        return
     lan = ("--lan" in sys.argv) or os.environ.get("TASTEBUDS_LAN") == "1"
     port = None
     if "--port" in sys.argv:

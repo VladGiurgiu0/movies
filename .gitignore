@@ -9,6 +9,9 @@ build/
 dist/
 *.dmg
 assets/icon.icns
+assets/icon.ico
+dmg/
+wheels/
 
 # --- Personal data: keep your own ratings/watchlist private ---
 movies.md
