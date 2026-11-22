@@ -2,6 +2,11 @@
 
 > **your movie taste — and your buddies'.** Private, on your machine, made with love.
 
+**Download:** [Mac (Apple Silicon)](https://github.com/VladGiurgiu0/movies/releases/latest/download/Tastebuds-Mac.dmg)
+· [Windows 10/11](https://github.com/VladGiurgiu0/movies/releases/latest/download/Tastebuds-Windows-Setup.exe)
+· [how to install](INSTALL.md) — one file, one double-click. (The "Source code"
+downloads on the Releases page are for developers; you don't need them.)
+
 **Tastebuds** is a tiny, local movie companion. You rate the films you've seen,
 one at a time, and it learns *your* taste and starts recommending films
 you'll actually love. The name is a little pun: **taste** — the palate it learns
@@ -24,13 +29,13 @@ dependency (NumPy).
 
 **The easy way — download and open, no Python, no terminal.**
 
-Go to [Releases](https://github.com/VladGiurgiu0/movies/releases/latest) and
-download:
-
-- **Mac (Apple Silicon, M1 or newer):** `Tastebuds-…-mac-AppleSilicon.dmg` —
+- **Mac (Apple Silicon, M1 or newer):** [Tastebuds-Mac.dmg](https://github.com/VladGiurgiu0/movies/releases/latest/download/Tastebuds-Mac.dmg) —
   open it and drag Tastebuds into Applications.
-- **Windows 10/11:** `TastebudsSetup-….exe` — run it; it installs for your
-  user only, no administrator rights needed.
+- **Windows 10/11:** [Tastebuds-Windows-Setup.exe](https://github.com/VladGiurgiu0/movies/releases/latest/download/Tastebuds-Windows-Setup.exe) —
+  run it; it installs for your user only, no administrator rights needed.
+
+These links always fetch the newest version, so they are the ones to send to
+friends.
 
 The downloads aren't signed yet, so the very first launch shows a one-time
 security warning. [INSTALL.md](INSTALL.md) shows exactly what to click, on
@@ -248,7 +253,7 @@ packaging and notarization notes.
 
 ## Windows — details
 
-`TastebudsSetup-….exe` installs Tastebuds for your user only (into
+`Tastebuds-Windows-Setup.exe` installs Tastebuds for your user only (into
 `%LOCALAPPDATA%\Programs\Tastebuds`, no administrator rights), with a
 Start-menu entry, an optional desktop icon, and an uninstaller in
 **Settings → Apps**. Python and NumPy are bundled; the window uses the Edge

@@ -120,10 +120,25 @@ def selftest():
         if getattr(sys, "frozen", False):   # the built app must carry pywebview
             import webview  # noqa: F401
 
+    def certificates():
+        import ssl                          # HTTPS to TMDb needs root certificates
+        n = ssl.create_default_context().cert_store_stats().get("x509_ca", 0)
+        assert n > 0, "no root certificates available (HTTPS to TMDb would fail)"
+
+    def tmdb_reachable():
+        if os.environ.get("TASTEBUDS_SELFTEST_NET") != "1":
+            return                          # offline by default; CI switches it on
+        import urllib.error
+        try:                                # no key: TMDb answers 401 — over working TLS
+            urllib.request.urlopen("https://api.themoviedb.org/3/configuration", timeout=15)
+        except urllib.error.HTTPError:
+            pass
+
     lines, failed = ["Tastebuds %s selftest · python %s · %s" % (
         tastebuds.VERSION, sys.version.split()[0], sys.platform)], 0
     for name, fn in (("page", page), ("icon", icon), ("api", api), ("numpy", numpy_ok),
-                     ("recommender", recommender), ("window", window_lib)):
+                     ("recommender", recommender), ("window", window_lib),
+                     ("certificates", certificates), ("tmdb-https", tmdb_reachable)):
         try:
             fn()
             lines.append("  ok    " + name)

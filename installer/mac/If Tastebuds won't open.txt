@@ -1,0 +1,24 @@
+Tastebuds - first time opening it
+
+Tastebuds is a free hobby app and isn't signed with a paid Apple certificate,
+so the first time you open it, your Mac asks you to confirm. You only do this
+once.
+
+1. Drag Tastebuds onto the Applications folder in this window.
+2. Open your Applications folder and double-click Tastebuds.
+3. A message says Apple could not verify Tastebuds. Click Done.
+4. Open System Settings, then Privacy & Security.
+5. Scroll down. Next to "Tastebuds was blocked", click Open Anyway.
+6. Enter your Mac password if asked, then click Open.
+
+From now on, Tastebuds opens like any other app.
+
+On macOS 14 (Sonoma) or older, there is a shortcut instead of steps 3 to 6:
+right-click Tastebuds in Applications, choose Open, then click Open again.
+
+If the Mac says the app "is damaged and can't be opened": open the Terminal
+app, paste the line below, press Return, and open Tastebuds again.
+
+    xattr -dr com.apple.quarantine /Applications/Tastebuds.app
+
+More help: https://github.com/VladGiurgiu0/movies/blob/main/INSTALL.md

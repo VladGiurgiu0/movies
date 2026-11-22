@@ -913,6 +913,48 @@ class TestPairingOnDemand(unittest.TestCase):
             tb.LAN_MODE = False
 
 
+class TestPackagedAppNetwork(unittest.TestCase):
+    """The first Mac download showed 'No more candidates' because its bundled
+    Python found no root certificates, and the error was swallowed."""
+
+    def test_frozen_app_with_empty_store_uses_certifi(self):
+        import subprocess
+        try:
+            import certifi  # noqa: F401
+        except ImportError:
+            self.skipTest("certifi not installed")
+        code = ("import sys, os; sys.frozen = True; sys.path.insert(0, %r); "
+                "import tastebuds, certifi; "
+                "print(os.environ.get('SSL_CERT_FILE') == certifi.where())" % ROOT)
+        env = dict(os.environ, SSL_CERT_FILE=os.path.join(tempfile.mkdtemp(), "none.pem"),
+                   SSL_CERT_DIR=tempfile.mkdtemp(), TASTEBUDS_HOME=tempfile.mkdtemp())
+        out = subprocess.run([sys.executable, "-c", code], env=env,
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.strip(), "True", out.stderr)
+
+    def test_source_install_is_left_alone(self):
+        self.assertFalse(getattr(sys, "frozen", False))
+        self.assertFalse(tb._ensure_ca_certs())
+
+    def test_unreachable_tmdb_is_reported_not_hidden(self):
+        import urllib.error
+        saved = {k: getattr(tb, k) for k in ("load_channels", "fetch_channel")}
+        tb.load_channels = lambda: [{"name": "x", "enabled": True}]
+
+        def boom(channel):
+            raise urllib.error.URLError("CERTIFICATE_VERIFY_FAILED")
+
+        tb.fetch_channel = boom
+        tb._buffer.clear()
+        try:
+            out = tb.next_candidate()
+        finally:
+            for k, v in saved.items():
+                setattr(tb, k, v)
+        self.assertEqual(out["error"], "network")
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", out["detail"])
+
+
 class TestAboutAndVersion(unittest.TestCase):
     def test_version_is_semver(self):
         import re

@@ -3,11 +3,15 @@
 No Python, no terminal. About five minutes, most of it the one-time security
 step below. Your ratings stay on your own computer.
 
-Get the download from the
-[latest release](https://github.com/VladGiurgiu0/movies/releases/latest):
+Download the one file for your computer:
 
-- **Mac** with Apple Silicon (M1 or newer): the file ending in `mac-AppleSilicon.dmg`
-- **Windows 10 or 11:** the file starting with `TastebudsSetup`
+- **Mac** with Apple Silicon (M1 or newer):
+  [Tastebuds-Mac.dmg](https://github.com/VladGiurgiu0/movies/releases/latest/download/Tastebuds-Mac.dmg)
+- **Windows 10 or 11:**
+  [Tastebuds-Windows-Setup.exe](https://github.com/VladGiurgiu0/movies/releases/latest/download/Tastebuds-Windows-Setup.exe)
+
+(On the Releases page you'll also see "Source code" downloads. Those are for
+developers; you don't need them.)
 
 Why the warning? Tastebuds is a free hobby project, and its downloads aren't
 signed with a paid Apple or Microsoft certificate. So the first time you open it,
@@ -18,8 +22,10 @@ like any other app.
 
 ## Mac
 
-1. Double-click the `.dmg` you downloaded.
+1. Double-click `Tastebuds-Mac.dmg`.
 2. Drag **Tastebuds** onto the **Applications** folder in the window that opens.
+   (The same window has a short note, "If Tastebuds won't open", with the
+   steps below.)
 3. Open **Applications** and double-click **Tastebuds**.
 4. A message says Apple could not verify Tastebuds. Click **Done**.
 5. Open **System Settings** and go to **Privacy & Security**.
@@ -44,7 +50,7 @@ xattr -dr com.apple.quarantine /Applications/Tastebuds.app
 1. Your browser may say the file "isn't commonly downloaded". Choose **Keep**
    (in Edge: click **...** next to the download, then **Keep**, then
    **Show more** and **Keep anyway**).
-2. Double-click `TastebudsSetup-....exe`.
+2. Double-click `Tastebuds-Windows-Setup.exe`.
 3. A blue box says "Windows protected your PC". Click **More info**, then
    **Run anyway**.
 4. Click through the installer. It installs for you only, so it doesn't ask

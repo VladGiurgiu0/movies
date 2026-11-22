@@ -55,10 +55,32 @@ import urllib.error
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+def _ensure_ca_certs():
+    """A packaged app (PyInstaller) carries its own Python, whose OpenSSL may
+    look for root certificates in a folder that doesn't exist on this
+    computer — then every HTTPS call to TMDb fails. If the default store comes
+    up empty, point OpenSSL at certifi's bundle, which ships inside the app.
+    Source installs are left alone. Returns True if it switched."""
+    if not getattr(sys, "frozen", False):
+        return False
+    try:
+        import ssl
+        if ssl.create_default_context().cert_store_stats().get("x509_ca", 0):
+            return False
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        return True
+    except Exception:
+        return False
+
+
+_ensure_ca_certs()   # before the first HTTPS request (recommender included)
+
 # --------------------------------------------------------------------------
 # Config / paths
 # --------------------------------------------------------------------------
-VERSION = "1.0.0"   # bump together with the release tag (v1.0.0 -> builds the downloads)
+VERSION = "1.0.1"   # bump together with the release tag (v1.0.0 -> builds the downloads)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # where the CODE lives
 # Where the DATA lives — one rule everywhere (terminal, app, recommender):
 #   1. an explicit TASTEBUDS_HOME always wins;
@@ -979,22 +1001,27 @@ def next_candidate(include_shortlist=False):
         with _io_lock:
             already = ((seen_rated_ids() if include_shortlist else rated_ids())
                        | watchlist_ids() | not_interested_ids() | _shown_session)
-        attempts = 0
+        attempts, fetched, last_err = 0, False, None
         while not _buffer and attempts < 14:
             attempts += 1
             channel = random.choice(chans)
             try:
                 cands = fetch_channel(channel)
+                fetched = True
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):
                     return {"error": "auth"}
+                fetched = True          # TMDb answered; just not with films
                 continue
-            except Exception:
+            except Exception as e:
+                last_err = e
                 continue
             for c in cands:
                 if c["id"] not in already:
                     _buffer.append(c)
         if not _buffer:
+            if not fetched and last_err is not None:   # never reached TMDb at all
+                return {"error": "network", "detail": str(last_err)[:200]}
             return None
         movie = _buffer.pop(0)
         _shown_session.add(movie["id"])
@@ -2395,6 +2422,11 @@ function render(d){
     card.innerHTML='<div class="msg">No valid TMDb API key found.<br><br>'+
       'Put your key in a file named <code>tmdb_key.txt</code> next to the script, '+
       'or run <code>export TMDB_API_KEY=your_key</code>, then restart.</div>';
+    current=null; return;
+  }
+  if(d && d.error === 'network'){
+    card.innerHTML='<div class="msg">Can\'t reach The Movie Database right now.<br>Check the internet connection, then try again.'+
+      (d.detail?'<br><br><span style="font-size:12px;opacity:.6">'+esc(d.detail)+'</span>':'')+'</div>';
     current=null; return;
   }
   if(d && d.error === 'nochannels'){

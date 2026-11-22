@@ -52,7 +52,7 @@ jobs:
 
       - name: Build tools
         shell: bash
-        run: python -m pip install pyinstaller pywebview
+        run: python -m pip install pyinstaller pywebview certifi
 
       - name: NumPy for older macOS
         if: runner.os == 'macOS'
@@ -92,7 +92,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           code=0
-          TASTEBUDS_SELFTEST_REPORT="$RUNNER_TEMP/selftest.txt" \
+          TASTEBUDS_SELFTEST_NET=1 TASTEBUDS_SELFTEST_REPORT="$RUNNER_TEMP/selftest.txt" \
             dist/Tastebuds.app/Contents/MacOS/Tastebuds --selftest || code=$?
           cat "$RUNNER_TEMP/selftest.txt" || true
           exit $code
@@ -103,14 +103,16 @@ jobs:
           mkdir -p dmg
           ditto dist/Tastebuds.app dmg/Tastebuds.app
           ln -s /Applications dmg/Applications
+          cp "installer/mac/If Tastebuds won't open.txt" dmg/
           hdiutil create -volname "Tastebuds" -srcfolder dmg -ov -format UDZO \
-            "dist/Tastebuds-$VER-mac-AppleSilicon.dmg"
+            "dist/Tastebuds-Mac.dmg"
 
       # ---------------- Windows ----------------
       - name: Self-test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $env:TASTEBUDS_SELFTEST_NET = "1"
           $env:TASTEBUDS_SELFTEST_REPORT = "$env:RUNNER_TEMP\selftest.txt"
           $p = Start-Process -FilePath "dist\Tastebuds\Tastebuds.exe" -ArgumentList "--selftest" -Wait -PassThru
           Get-Content $env:TASTEBUDS_SELFTEST_REPORT -ErrorAction SilentlyContinue
@@ -128,8 +130,8 @@ jobs:
         with:
           name: tastebuds-${{ matrix.label }}
           path: |
-            dist/*.dmg
-            dist/TastebudsSetup-*.exe
+            dist/Tastebuds-Mac.dmg
+            dist/Tastebuds-Windows-Setup.exe
           if-no-files-found: error
 
   release:
@@ -147,9 +149,14 @@ jobs:
         run: |
           TAG="$GITHUB_REF_NAME"
           cat > notes.md <<NOTES
-          **Download:** the \`.dmg\` for a Mac with Apple Silicon (M1 or newer), the \`Setup\` \`.exe\` for Windows 10/11.
+          ## Download
 
-          These builds are not signed, so the first launch shows a one-time warning. Step-by-step help, with what to click: [INSTALL.md](https://github.com/$GITHUB_REPOSITORY/blob/main/INSTALL.md).
+          - **Mac** (Apple Silicon, M1 or newer): **Tastebuds-Mac.dmg**
+          - **Windows** 10 or 11: **Tastebuds-Windows-Setup.exe**
+
+          Pick one file from the list below. You don't need the "Source code" files; they are for developers.
+
+          The first time you open Tastebuds, your computer shows a one-time warning, because the app isn't signed with a paid certificate. Step-by-step help: [INSTALL.md](https://github.com/$GITHUB_REPOSITORY/blob/main/INSTALL.md).
           NOTES
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber

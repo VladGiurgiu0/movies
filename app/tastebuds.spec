@@ -35,7 +35,7 @@ a = Analysis(
     datas=datas,
     # recommend.py is loaded as a file at runtime, so name the modules it
     # needs that nothing else imports.
-    hiddenimports=["numpy", "webview", "argparse", "hashlib"],
+    hiddenimports=["numpy", "webview", "argparse", "hashlib", "certifi"],
     excludes=["matplotlib", "pandas", "PIL", "cv2", "tkinter"],
     cipher=block_cipher,
 )
