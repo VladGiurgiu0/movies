@@ -47,7 +47,9 @@ both systems.
    or `git clone https://github.com/VladGiurgiu0/movies.git`.
 2. In the folder, double-click **`Install Tastebuds.command`**. It checks Python
    (macOS offers to install its own if missing), sets up the recommender, and puts
-   **Tastebuds — with its own icon — in ~/Applications**, then opens it. If macOS
+   **DEV_Tastebuds — with its own icon — in ~/Applications**, then opens it.
+   (It runs the code in this folder, so your edits apply on its next start; the
+   different name keeps it apart from the downloaded Tastebuds.) If macOS
    warns about an unidentified developer (ZIP downloads), right-click the file and
    choose **Open**, once.
 3. Done. From now on it launches like any app — Spotlight, Launchpad, or the Dock.
@@ -206,9 +208,14 @@ Pairing is **off until you switch it on**. Click **Pair a phone** (top right,
 next to the Movie night switch) and then **Turn on pairing**: from then until
 you quit (or click **Turn off pairing**), phones and tablets on the same Wi-Fi
 can reach Tastebuds — but only those that scan the code. Your computer may ask
-once whether Tastebuds can accept incoming connections; choose **Allow**. (To
-keep pairing on from the start instead, run `python3 tastebuds.py --lan`, or
-set `TASTEBUDS_LAN=1` for the app.)
+once whether Tastebuds can accept incoming connections; choose **Allow**. To
+have pairing switch itself on every time Tastebuds starts, tick **Keep pairing
+on when Tastebuds starts** in the same panel.
+
+While pairing is on, Tastebuds follows your computer to another Wi-Fi within a
+few seconds, so a paired phone keeps working wherever both devices share a
+network. University, hotel, and café networks often block devices from
+reaching each other; home Wi-Fi or a phone hotspot works.
 
 Scan the QR code with the phone's camera, and in Safari choose **Share → Add to Home
 Screen**. Tastebuds now opens from the phone like an app — same data, same
@@ -226,8 +233,10 @@ house.
 The installer from [Get started](#get-started) is an ordinary, readable shell
 script: it checks Python, installs NumPy (and tries pywebview, for a native
 window — without it the app opens in your browser, which works just as well),
-creates your data folder at `~/Tastebuds`, and assembles the app in
+creates your data folder at `~/Tastebuds`, and assembles `DEV_Tastebuds.app` in
 `~/Applications`. **Run it again anytime** — it only refreshes what's there.
+DEV_Tastebuds and a downloaded Tastebuds share the same data folder, so run
+one at a time: if one is already open, starting the other just shows the open one.
 
 The app behaves like a proper Mac citizen: the window's **close button hides
 it into the Dock** while the server keeps running — so a paired phone or
@@ -300,6 +309,7 @@ pools just need to point in roughly the right direction. Channels live in
 | `model_weights.json` | **no** (git-ignored) | how strongly each reaction trains your model — set in the Model panel |
 | `tmdb_key.txt` | **no** (git-ignored) | your private API key |
 | `lan_token.txt` | **no** (git-ignored) | the private pairing token for your phones — created the first time you turn on pairing |
+| `pairing.json` | **no** (git-ignored) | whether pairing switches on by itself at start (the Pair panel checkbox) |
 
 The data files are git-ignored so a public repo never leaks your taste log or
 key. The script recreates empty `movies.md` / `watchlist.md` from built-in

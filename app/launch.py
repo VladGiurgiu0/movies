@@ -182,7 +182,9 @@ def main():
         log("port %d busy (not Tastebuds) — using a free port" % port)
         server, url = tastebuds.create_server(lan=False)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log("server up at %s · lan=%s" % (url, tastebuds.LAN_MODE))
+    paired = tastebuds.start_saved_pairing()   # the Pair panel's "keep pairing on" checkbox
+    log("server up at %s · lan=%s · pairing at start: %s" % (
+        url, tastebuds.LAN_MODE, {None: "off", True: "on", False: "waiting for a network"}[paired]))
 
     try:
         import webview
@@ -208,7 +210,8 @@ def main():
             width = min(940, int(vf.size.width) - 60)
         except Exception as e:
             log("screen size lookup failed: %s" % e)
-    window = webview.create_window("Tastebuds", url, width=width, height=height,
+    title = os.environ.get("TASTEBUDS_APP_NAME") or "Tastebuds"   # DEV_Tastebuds when run from the code
+    window = webview.create_window(title, url, width=width, height=height,
                                    min_size=(680, 620))
     log("window %dx%d" % (width, height))
     state = {"dock": False, "hidden": False, "quitting": False,

@@ -80,7 +80,7 @@ _ensure_ca_certs()   # before the first HTTPS request (recommender included)
 # --------------------------------------------------------------------------
 # Config / paths
 # --------------------------------------------------------------------------
-VERSION = "1.0.1"   # bump together with the release tag (v1.0.0 -> builds the downloads)
+VERSION = "1.0.2"   # bump together with the release tag (v1.0.0 -> builds the downloads)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # where the CODE lives
 # Where the DATA lives — one rule everywhere (terminal, app, recommender):
 #   1. an explicit TASTEBUDS_HOME always wins;
@@ -1253,6 +1253,11 @@ LAN_PORT_DEFAULT = 8765
 LAN_TOKEN_PATH = os.path.join(DATA_DIR, "lan_token.txt")
 PAIR_TOKEN = None    # what paired devices present (persistent); the local window keeps TOKEN
 _LAN_SERVER = None   # the on-demand pairing listener; None when off or fixed by --lan
+PAIRING_PATH = os.path.join(DATA_DIR, "pairing.json")   # {"on_start": bool} — Pair panel checkbox
+_PAIR_WANTED = False  # the user's switch; the watcher keeps a listener up while it's on
+_lan_lock = threading.Lock()
+_lan_watcher = None
+LAN_WATCH_SECONDS = 5
 
 
 def lan_ip():
@@ -1372,6 +1377,75 @@ def disable_lan():
     except Exception:
         pass
     return True, "off"
+
+
+def pair_on_start():
+    """Did the user tick 'Keep pairing on when Tastebuds starts'? (default: no)"""
+    try:
+        with open(PAIRING_PATH, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get("on_start"))
+    except Exception:
+        return False
+
+
+def set_pair_on_start(on):
+    _atomic_write(PAIRING_PATH, json.dumps({"on_start": bool(on)}) + "\n")
+
+
+def want_pairing(on):
+    """The user's on/off switch. While on, a watcher keeps the listener up:
+    it starts pairing once a network appears and follows Wi-Fi changes."""
+    global _PAIR_WANTED
+    with _lan_lock:
+        _PAIR_WANTED = bool(on)
+        result = enable_lan() if on else disable_lan()
+    if on:
+        _start_lan_watcher()
+    return result
+
+
+def lan_tick():
+    """One watcher step. Moving to another Wi-Fi gives this computer a new
+    address; the listener moves with it, and since paired devices use the
+    .local name, their home-screen icons keep working on the new network."""
+    with _lan_lock:
+        if not _PAIR_WANTED:
+            return None
+        if not LAN_MODE:                       # no network when switched on / at launch
+            return "started" if enable_lan()[0] else None
+        if _LAN_SERVER is None:                # --lan: already on every address
+            return None
+        ip = lan_ip()
+        if _usable_lan_ip(ip) and ip != LAN_IP:
+            port = LAN_PORT
+            disable_lan()
+            return "moved" if enable_lan(port)[0] else None
+    return None
+
+
+def _start_lan_watcher():
+    global _lan_watcher
+    if _lan_watcher is not None:
+        return
+
+    def loop():
+        import time as _time
+        while True:
+            _time.sleep(LAN_WATCH_SECONDS)
+            try:
+                lan_tick()
+            except Exception:
+                pass
+
+    _lan_watcher = threading.Thread(target=loop, daemon=True)
+    _lan_watcher.start()
+
+
+def start_saved_pairing():
+    """At launch: switch pairing on if the user asked for that in the Pair panel."""
+    if LAN_MODE or not pair_on_start():
+        return None
+    return want_pairing(True)[0]
 
 
 def open_data_folder():
@@ -2340,6 +2414,7 @@ PAGE = r"""<!DOCTYPE html>
       <div id="pair-qr" style="display:flex;justify-content:center;margin:14px 0"></div>
       <div class="note" id="pair-url" style="text-align:center;word-break:break-all"></div>
       <div style="text-align:center;margin-top:8px"><button class="ghost" id="pair-stop" hidden>Turn off pairing</button></div>
+      <div id="pair-auto-row" hidden><label class="note" style="display:flex;align-items:center;justify-content:center;gap:7px;margin-top:14px;cursor:pointer"><input type="checkbox" id="pair-auto">Keep pairing on when Tastebuds starts</label></div>
       <ol class="desc" style="margin-top:14px;padding-left:20px;line-height:1.8">
         <li>Scan the code with the phone's camera and open the link.</li>
         <li>In Safari: <b>Share</b> &rarr; <b>Add to Home Screen</b>.</li>
@@ -3345,6 +3420,8 @@ function renderPair(d){
   const on=!!(d && d.url);
   document.getElementById('pair-off').hidden = on;
   document.getElementById('pair-stop').hidden = !(on && d.can_toggle);
+  document.getElementById('pair-auto-row').hidden = !(d && (d.can_toggle || !on));   // not for --lan
+  document.getElementById('pair-auto').checked = !!(d && d.autostart);
   if(on){
     qr.innerHTML=d.svg;
     u.innerHTML=esc(d.url)+(d.alt?('<br><span style="opacity:.65">not opening? try '+esc(d.alt)+'</span>'):'');
@@ -3355,6 +3432,7 @@ async function openPair(){
   document.getElementById('pair-err').textContent='';
   document.getElementById('pair-off').hidden=true;
   document.getElementById('pair-stop').hidden=true;
+  document.getElementById('pair-auto-row').hidden=true;
   const qr=document.getElementById('pair-qr'), u=document.getElementById('pair-url');
   qr.innerHTML='<div class="note">…</div>'; u.textContent='';
   try{ renderPair(await (await fetch('/api/pair')).json()); }
@@ -3373,6 +3451,14 @@ async function pairSwitch(on){
 document.getElementById('pair-btn').onclick = openPair;
 document.getElementById('pair-on').onclick = ()=>pairSwitch(true);
 document.getElementById('pair-stop').onclick = ()=>pairSwitch(false);
+document.getElementById('pair-auto').onchange = async e=>{
+  const cb=e.target, err=document.getElementById('pair-err'); err.textContent='';
+  try{
+    const d=await (await fetch('/api/pair/autostart',{method:'POST',body:JSON.stringify({on:cb.checked})})).json();
+    if(!d.ok) throw new Error(d.error||'');
+    cb.checked=!!d.autostart;
+  }catch(x){ cb.checked=!cb.checked; err.textContent='Could not save that setting.'; }
+};
 /* ---- About ---- */
 async function openAbout(){
   document.getElementById('about-overlay').classList.add('open');
@@ -3589,7 +3675,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"lan": LAN_MODE, "url": u,
                                         "alt": ui if (u and ui != u) else None,
                                         "svg": qr_svg(u) if u else None,
-                                        "can_toggle": self._is_local_peer() and _LAN_SERVER is not None}))
+                                        "can_toggle": self._is_local_peer() and _LAN_SERVER is not None,
+                                        "autostart": pair_on_start()}))
             return
         if p.path == "/api/about":
             local = self._is_local_peer()
@@ -3677,19 +3764,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, json.dumps({"error": "forbidden"}))
             return
 
-        if self.path in ("/api/pair/enable", "/api/pair/disable", "/api/open-data-folder"):
+        if self.path in ("/api/pair/enable", "/api/pair/disable", "/api/pair/autostart",
+                         "/api/open-data-folder"):
             if not self._is_local_peer():   # only the computer itself may flip these
                 self._send(403, json.dumps({"error": "forbidden"}))
                 return
             if self.path == "/api/open-data-folder":
                 self._send(200, json.dumps({"ok": open_data_folder()}))
                 return
-            ok, msg = enable_lan() if self.path.endswith("/enable") else disable_lan()
+            if self.path == "/api/pair/autostart":
+                try:
+                    set_pair_on_start(bool(json.loads(raw.decode("utf-8") or "{}").get("on")))
+                except Exception as e:
+                    self._send(400, json.dumps({"ok": False, "error": str(e)}))
+                    return
+                self._send(200, json.dumps({"ok": True, "autostart": pair_on_start()}))
+                return
+            ok, msg = want_pairing(self.path.endswith("/enable"))
             u, ui = pair_url(), pair_url_ip()
             self._send(200, json.dumps({"ok": ok, "message": msg, "lan": LAN_MODE, "url": u,
                                         "alt": ui if (u and ui != u) else None,
                                         "svg": qr_svg(u) if u else None,
-                                        "can_toggle": _LAN_SERVER is not None}))
+                                        "can_toggle": _LAN_SERVER is not None,
+                                        "autostart": pair_on_start()}))
             return
 
         if self.path.startswith("/api/rate"):
@@ -3960,6 +4057,8 @@ def main():
         print("        Free key: https://www.themoviedb.org/settings/api")
         print("        Starting anyway so you can see the UI.\n")
     server, url = create_server(lan=lan, port=port)
+    if start_saved_pairing():
+        print("  Pairing is on (Pair a phone > 'Keep pairing on when Tastebuds starts').")
     print(f"  Rating UI running at {url}")
     if lan:
         print(f"  LAN pairing on:      {pair_url()}")

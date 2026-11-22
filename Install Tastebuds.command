@@ -5,9 +5,14 @@
 #   1. checks Python 3 (macOS offers to install its command line tools if missing)
 #   2. installs NumPy for the recommender (and tries pywebview for a native window)
 #   3. creates your data folder at ~/Tastebuds
-#   4. builds the app icon and assembles Tastebuds.app in ~/Applications
+#   4. builds the app icon and assembles DEV_Tastebuds.app in ~/Applications
 #   5. opens the app
 # Everything stays on your machine. Run it again anytime — it only refreshes.
+#
+# DEV_Tastebuds runs the code in THIS folder, so edits apply on its next start
+# (no reinstall). The ready-made download from Releases is plain "Tastebuds";
+# the different name and ID keep the two apart in Spotlight and the Dock.
+# Both read the same data folder (~/Tastebuds): run one at a time.
 
 cd "$(dirname "$0")"
 REPO="$(pwd)"
@@ -55,16 +60,23 @@ if command -v iconutil >/dev/null 2>&1 && [ -d "$REPO/assets/icon.iconset" ]; th
   iconutil -c icns "$REPO/assets/icon.iconset" -o "$REPO/assets/icon.icns" 2>/dev/null || true
 fi
 
-# --- 5. Assemble Tastebuds.app in ~/Applications ------------------------------
-APP="$HOME/Applications/Tastebuds.app"
+# --- 5. Assemble DEV_Tastebuds.app in ~/Applications --------------------------
+APP_NAME="DEV_Tastebuds"
+APP="$HOME/Applications/$APP_NAME.app"
+# An older copy of this script made ~/Applications/Tastebuds.app; retire it
+# (only if it is that script-made wrapper, never a downloaded app).
+OLD="$HOME/Applications/Tastebuds.app"
+if [ -f "$OLD/Contents/MacOS/Tastebuds" ] && grep -q "app/launch.py" "$OLD/Contents/MacOS/Tastebuds" 2>/dev/null; then
+  rm -rf "$OLD" && echo "  Removed the old script-made ~/Applications/Tastebuds.app"
+fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Tastebuds</string>
-  <key>CFBundleDisplayName</key><string>Tastebuds</string>
-  <key>CFBundleIdentifier</key><string>com.vladgiurgiu.tastebuds</string>
+  <key>CFBundleName</key><string>$APP_NAME</string>
+  <key>CFBundleDisplayName</key><string>$APP_NAME</string>
+  <key>CFBundleIdentifier</key><string>com.vladgiurgiu.tastebuds.dev</string>
   <key>CFBundleExecutable</key><string>Tastebuds</string>
   <key>CFBundleIconFile</key><string>icon.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
@@ -76,6 +88,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 cat > "$APP/Contents/MacOS/Tastebuds" <<LAUNCH
 #!/bin/bash
+export TASTEBUDS_APP_NAME="$APP_NAME"
 exec "$PY" "$REPO/app/launch.py"
 LAUNCH
 chmod +x "$APP/Contents/MacOS/Tastebuds"
@@ -84,7 +97,7 @@ echo "  Installed: $APP"
 
 # --- 6. Off we go --------------------------------------------------------------
 echo ""
-echo "  Done. Tastebuds is in ~/Applications (find it with Spotlight or Launchpad,"
+echo "  Done. $APP_NAME is in ~/Applications (find it with Spotlight or Launchpad,"
 echo "  and drag it to the Dock if you like). Starting it now..."
 echo ""
 if [ "${TASTEBUDS_INSTALL_NO_OPEN:-0}" != "1" ]; then

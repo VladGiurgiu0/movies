@@ -840,16 +840,21 @@ class TestPairingOnDemand(unittest.TestCase):
         self.lan_port = s.getsockname()[1]
         s.close()
         self.saved = {k: getattr(tb, k) for k in
-                      ("lan_ip", "_usable_lan_ip", "lan_hostname", "LAN_TOKEN_PATH")}
+                      ("lan_ip", "_usable_lan_ip", "lan_hostname", "LAN_TOKEN_PATH",
+                       "PAIRING_PATH", "LAN_PORT_DEFAULT", "_start_lan_watcher")}
         tb.lan_ip = lambda: "127.0.0.2"
-        tb._usable_lan_ip = lambda ip: True
+        tb._usable_lan_ip = lambda ip: ip != "127.0.0.1"
         tb.lan_hostname = lambda: None
         tb.LAN_TOKEN_PATH = os.path.join(tempfile.mkdtemp(), "lan_token.txt")
+        tb.PAIRING_PATH = os.path.join(tempfile.mkdtemp(), "pairing.json")
+        tb.LAN_PORT_DEFAULT = self.lan_port
+        tb._start_lan_watcher = lambda: None     # tests drive lan_tick() by hand
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), tb.Handler)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
 
     def tearDown(self):
+        tb._PAIR_WANTED = False
         tb.disable_lan()
         self.srv.shutdown()
         self.srv.server_close()
@@ -903,6 +908,56 @@ class TestPairingOnDemand(unittest.TestCase):
         tb.enable_lan(port=self.lan_port)
         self.assertEqual(tb.PAIR_TOKEN, pt)
         self.assertEqual(self._phone("/?t=" + pt)[0], 200)
+
+    def test_keep_pairing_on_checkbox(self):
+        self.assertFalse(tb.pair_on_start())              # off by default
+        self.assertIsNone(tb.start_saved_pairing())
+        self.assertFalse(tb.LAN_MODE)
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/pair/autostart", body=json.dumps({"on": True}),
+                  headers={"X-Token": tb.TOKEN})
+        self.assertTrue(json.loads(c.getresponse().read())["autostart"])
+        self.assertTrue(tb.pair_on_start())
+        self.assertTrue(tb.start_saved_pairing())          # next launch: on by itself
+        self.assertTrue(tb.LAN_MODE)
+        self.assertEqual(self._phone("/api/pair/autostart", tb.PAIR_TOKEN, "POST")[0], 403)
+        self.assertTrue(json.loads(self._local("/api/pair")[1])["autostart"])
+
+    def test_follows_a_wifi_change(self):
+        import socket
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.4", self.lan_port))
+        except OSError:
+            self.skipTest("127.0.0.4 not available")
+        finally:
+            s.close()
+        self.assertTrue(tb.want_pairing(True)[0])
+        pt = tb.PAIR_TOKEN
+        self.assertIsNone(tb.lan_tick())                   # same network: nothing to do
+        tb.lan_ip = lambda: "127.0.0.4"                    # moved to another Wi-Fi
+        self.assertEqual(tb.lan_tick(), "moved")
+        self.assertEqual(tb.LAN_IP, "127.0.0.4")
+        st, _ = self._req("127.0.0.4", self.lan_port, "/?t=" + pt, src="127.0.0.3")
+        self.assertEqual(st, 200)
+        with self.assertRaises(OSError):
+            self._phone("/?t=" + pt)                       # old address released
+
+    def test_waits_for_a_network_then_starts(self):
+        tb.lan_ip = lambda: "127.0.0.1"                    # offline
+        ok, _ = tb.want_pairing(True)
+        self.assertFalse(ok)
+        self.assertIsNone(tb.lan_tick())
+        tb.lan_ip = lambda: "127.0.0.2"                    # Wi-Fi back
+        self.assertEqual(tb.lan_tick(), "started")
+        self.assertEqual(self._phone("/?t=" + tb.PAIR_TOKEN)[0], 200)
+
+    def test_switching_off_stops_the_watcher_restarting_it(self):
+        tb.want_pairing(True)
+        tb.want_pairing(False)
+        self.assertIsNone(tb.lan_tick())
+        self.assertFalse(tb.LAN_MODE)
 
     def test_startup_lan_cannot_be_switched_off(self):
         tb.LAN_MODE, tb._LAN_SERVER = True, None              # as after --lan

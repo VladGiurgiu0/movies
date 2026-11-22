@@ -2,6 +2,7 @@
 tmdb_key.txt
 .env
 lan_token.txt
+pairing.json
 app.log
 
 # --- App build artifacts (built locally with `make app`) ---
